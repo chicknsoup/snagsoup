@@ -112,14 +112,13 @@ pub fn detect_smart_objects(bmp: &TiledBitmap) -> Vec<SmartElement> {
     out
 }
 
-/// Lifts a detected UI element at `rect` out of `session.bitmap`:
-/// 1. Extracts `rect` as a floating PNG `CaptureObject` (`ToolMode::Image`).
-/// 2. Inpaints `rect` cleanly on `session.bitmap` using our two-tier inpainter.
-/// 3. Records both the raster snapshot and the new floating object in `DocumentSession`.
-pub fn lift_smart_object(
+/// Lifts a detected UI element at `rect` out of `session.bitmap` **without** pushing history yet,
+/// returning `(obj_idx, before_bitmap, clipped_rect, inpaint_tier)` so an interactive drag can
+/// commit a single `HistoryCommand::Batch` at `mouse_up`.
+pub fn lift_smart_object_unrecorded(
     session: &mut DocumentSession,
     rect: PixelRect,
-) -> Result<(usize, Option<InpaintTierUsed>)> {
+) -> Result<(usize, TiledBitmap, PixelRect, Option<InpaintTierUsed>)> {
     let clipped = rect
         .intersect(session.bitmap.bounds())
         .ok_or_else(|| CvOcrError::InvalidInput("Lift rect out of bounds".to_string()))?;
@@ -130,13 +129,6 @@ pub fn lift_smart_object(
 
     let before_bitmap = session.bitmap.clone();
     let tier = inpaint_rect(&mut session.bitmap, clipped);
-    let after_bitmap = session.bitmap.clone();
-
-    session.history.push(HistoryCommand::RasterSnapshot {
-        before: before_bitmap,
-        after: after_bitmap,
-        dirty_rect: clipped,
-    });
     session.dirty.mark_rect(clipped);
 
     let obj = CaptureObject {
@@ -148,6 +140,28 @@ pub fn lift_smart_object(
         opacity: Some(100.0),
         ..CaptureObject::default()
     };
-    let idx = session.add_object(obj);
+    let idx = session.add_object_unrecorded(obj);
+    Ok((idx, before_bitmap, clipped, tier))
+}
+
+/// Lifts a detected UI element at `rect` out of `session.bitmap`:
+/// 1. Extracts `rect` as a floating PNG `CaptureObject` (`ToolMode::Image`).
+/// 2. Inpaints `rect` cleanly on `session.bitmap` using our two-tier inpainter.
+/// 3. Records both the raster snapshot and the new floating object as **one** atomic Undo step.
+pub fn lift_smart_object(
+    session: &mut DocumentSession,
+    rect: PixelRect,
+) -> Result<(usize, Option<InpaintTierUsed>)> {
+    let (idx, before_bitmap, clipped, tier) = lift_smart_object_unrecorded(session, rect)?;
+    let after_bitmap = session.bitmap.clone();
+    let object = session.page.capture_objects[idx].clone();
+    session.history.push(HistoryCommand::Batch(vec![
+        HistoryCommand::RasterSnapshot {
+            before: before_bitmap,
+            after: after_bitmap,
+            dirty_rect: clipped,
+        },
+        HistoryCommand::AddObject { index: idx, object },
+    ]));
     Ok((idx, tier))
 }

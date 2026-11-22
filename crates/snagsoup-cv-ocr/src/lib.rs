@@ -24,7 +24,7 @@ pub use ocr::{
     recognize_rgba_with_progress, OcrDocument, OcrLine, OcrWord,
 };
 pub use simplify_sui::auto_simplify;
-pub use smart_move::{detect_smart_objects, lift_smart_object, SmartElement};
+pub use smart_move::{detect_smart_objects, lift_smart_object, lift_smart_object_unrecorded, SmartElement};
 pub use xliff::{export_snagx_to_xliff, import_xliff_to_snagx, TranslationIssue};
 
 #[cfg(test)]

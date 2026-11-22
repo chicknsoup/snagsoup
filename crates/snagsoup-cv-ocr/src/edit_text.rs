@@ -83,20 +83,23 @@ pub fn edit_text_in_session(
         new_objects.push(obj);
     }
 
-    if let Some(dirty_rect) = dirty_union {
-        let after_bitmap = session.bitmap.clone();
-        session.history.push(HistoryCommand::RasterSnapshot {
-            before: before_bitmap,
-            after: after_bitmap,
-            dirty_rect,
-        });
-        session.dirty.mark_rect(dirty_rect);
-    }
+    let indices = session.execute_batch(|session| {
+        if let Some(dirty_rect) = dirty_union {
+            let after_bitmap = session.bitmap.clone();
+            session.history.push(HistoryCommand::RasterSnapshot {
+                before: before_bitmap,
+                after: after_bitmap,
+                dirty_rect,
+            });
+            session.dirty.mark_rect(dirty_rect);
+        }
 
-    let mut indices = Vec::with_capacity(new_objects.len());
-    for obj in new_objects {
-        indices.push(session.add_object(obj));
-    }
+        let mut indices = Vec::with_capacity(new_objects.len());
+        for obj in new_objects {
+            indices.push(session.add_object(obj));
+        }
+        indices
+    });
     Ok(indices)
 }
 

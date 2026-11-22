@@ -7,8 +7,8 @@
 //! - Selection (Rectangle, Ellipse, Lasso, Polygon)
 
 use snagsoup_canvas::{
-    CutOutOrientation, DocumentSession, PixelRect, crop_document, cut_out_strip, eraser_stroke,
-    flood_fill,
+    CutOutOrientation, DocumentSession, HistoryCommand, PixelRect, TiledBitmap, crop_document,
+    cut_out_strip, eraser_stroke, flood_fill,
 };
 use snagsoup_model::{CaptureObject, ColorRgba, PointF, RectF, ToolMode};
 
@@ -93,24 +93,63 @@ impl Default for RasterToolController {
 }
 
 impl RasterToolController {
-    /// Apply a continuous Eraser brush stroke onto `DocumentSession` (with CoW Undo).
+    /// Preview a continuous Eraser brush stroke from `base` onto `session.bitmap` without pushing
+    /// intermediate Undo history entries; returns the clipped dirty `PixelRect`.
+    pub fn preview_eraser_stroke_from_base(
+        &self,
+        session: &mut DocumentSession,
+        base: &TiledBitmap,
+        points: &[PointF],
+        fill_color: ColorRgba,
+    ) -> Option<PixelRect> {
+        if points.is_empty() {
+            return None;
+        }
+        let mut min_x = f64::INFINITY;
+        let mut min_y = f64::INFINITY;
+        let mut max_x = f64::NEG_INFINITY;
+        let mut max_y = f64::NEG_INFINITY;
+        for pt in points {
+            min_x = min_x.min(pt.x);
+            min_y = min_y.min(pt.y);
+            max_x = max_x.max(pt.x);
+            max_y = max_y.max(pt.y);
+        }
+        let pad = (self.eraser_radius as f64).max(1.0) + 2.0;
+        let x0 = (min_x - pad).floor().max(0.0) as u32;
+        let y0 = (min_y - pad).floor().max(0.0) as u32;
+        let x1 = (max_x + pad).ceil().max(x0 as f64 + 1.0) as u32;
+        let y1 = (max_y + pad).ceil().max(y0 as f64 + 1.0) as u32;
+        let dirty = PixelRect::new(x0, y0, x1 - x0, y1 - y0).intersect(base.bounds())?;
+
+        let mut next_bmp = base.clone();
+        eraser_stroke(&mut next_bmp, points, self.eraser_radius, fill_color);
+        session.bitmap = next_bmp;
+        session.dirty.mark_rect(dirty);
+        Some(dirty)
+    }
+
+    /// Apply a complete Eraser brush stroke onto `DocumentSession` as a single CoW Undo step.
     pub fn apply_eraser_stroke(
         &self,
         session: &mut DocumentSession,
         points: &[PointF],
         fill_color: ColorRgba,
     ) {
-        if points.is_empty() {
-            return;
+        let before = session.bitmap.clone();
+        if let Some(dirty_rect) =
+            self.preview_eraser_stroke_from_base(session, &before, points, fill_color)
+        {
+            let after = session.bitmap.clone();
+            session.history.push(HistoryCommand::RasterSnapshot {
+                before,
+                after,
+                dirty_rect,
+            });
         }
-        let mut next_bmp = session.bitmap.clone();
-        eraser_stroke(&mut next_bmp, points, self.eraser_radius, fill_color);
-        let (w, h) = (next_bmp.width(), next_bmp.height());
-        session.bitmap = next_bmp;
-        session.dirty.mark_all(w, h);
     }
 
-    /// Execute Flood Fill at `(x, y)` on `DocumentSession`.
+    /// Execute Flood Fill at `(x, y)` on `DocumentSession` as a single CoW Undo step.
     pub fn apply_flood_fill(
         &self,
         session: &mut DocumentSession,
@@ -118,18 +157,22 @@ impl RasterToolController {
         y: u32,
         fill_color: ColorRgba,
     ) -> bool {
-        if flood_fill(
+        let before = session.bitmap.clone();
+        if let Some(dirty_rect) = flood_fill(
             &mut session.bitmap,
             x,
             y,
             fill_color,
             self.fill_tolerance,
             self.fill_antialiasing,
-        )
-        .is_some()
-        {
-            let (w, h) = (session.bitmap.width(), session.bitmap.height());
-            session.dirty.mark_all(w, h);
+        ) {
+            let after = session.bitmap.clone();
+            session.history.push(HistoryCommand::RasterSnapshot {
+                before,
+                after,
+                dirty_rect,
+            });
+            session.dirty.mark_rect(dirty_rect);
             true
         } else {
             false

@@ -16,7 +16,7 @@ use gpui::{
     UTF16Selection, Window, canvas, div, img, prelude::FluentBuilder, px, rgb, rgba,
 };
 use snagsoup_canvas::{
-    CutOutOrientation, DocumentSession, PixelRect, SceneCompositor, TiledBitmap,
+    CutOutOrientation, DocumentSession, HistoryCommand, PixelRect, SceneCompositor, TiledBitmap,
     downscale_rgba_bilinear, hit_test_object,
 };
 use snagsoup_library_export::{
@@ -230,19 +230,45 @@ pub fn library_db_path() -> PathBuf {
     base.join("SnagSoup").join("library.db")
 }
 
+/// Tracks how an active inline text editing session (`editing_text_obj`) commits to Undo history.
+#[derive(Debug, Clone)]
+pub enum TextEditBaseline {
+    /// Newly created `Text` / `Callout`: live typing updates its `AddObject` history entry in place.
+    NewObject,
+    /// Existing `Text` / `Callout`: pre-edit snapshot committed as a single `UpdateObject` on finish.
+    ExistingObject(CaptureObject),
+}
+
 /// Active interactive mouse drag operation on the Editor Canvas.
 #[derive(Debug, Clone)]
 pub enum CanvasDragOp {
-    CreateObject { obj_idx: usize },
-    MoveObject { last_canvas: PointF },
-    EraseStroke { points: Vec<PointF> },
-    RegionTool { start: PointF, current: PointF },
-    Pan { last_screen: (f32, f32) },
+    CreateObject {
+        obj_idx: usize,
+        origin: PointF,
+    },
+    MoveObject {
+        last_canvas: PointF,
+        before_objects: Vec<(usize, CaptureObject)>,
+        smart_move_lift: Option<(TiledBitmap, PixelRect, usize)>,
+    },
+    EraseStroke {
+        before_bitmap: TiledBitmap,
+        points: Vec<PointF>,
+    },
+    RegionTool {
+        start: PointF,
+        current: PointF,
+    },
+    Pan {
+        last_screen: (f32, f32),
+    },
     EffectSpotlight {
         effect_idx: usize,
         part: EffectGizmoPart,
         start_canvas: PointF,
         orig_rect: RectF,
+        before_bitmap: TiledBitmap,
+        before_objects: Vec<CaptureObject>,
     },
 }
 
@@ -290,6 +316,7 @@ pub struct EditorShellState {
     pub font_size: f32,
     pub inline_text: InlineTextEditor,
     pub editing_text_obj: Option<usize>,
+    pub editing_text_baseline: Option<TextEditBaseline>,
     pub active_selection_rect: Option<RectF>,
     pub pending_crop_rect: Option<RectF>,
     pub pending_fit_canvas: bool,
@@ -361,6 +388,7 @@ impl Default for EditorShellState {
             font_size: 20.0,
             inline_text: InlineTextEditor::default(),
             editing_text_obj: None,
+            editing_text_baseline: None,
             active_selection_rect: None,
             pending_crop_rect: None,
             pending_fit_canvas: true,
@@ -517,14 +545,17 @@ impl EditorShellState {
         )
     }
 
-    /// Execute Undo (`Ctrl+Z`), keeping selection indices & active masks consistent.
+    /// Execute Undo (`Ctrl+Z`), keeping selection indices, Step numbering & active masks consistent.
     pub fn perform_undo(&mut self) -> bool {
+        self.finish_text_editing();
+        self.active_drag = None;
         if self.session.undo() {
             let len = self.session.page.capture_objects.len();
             self.gizmos_g1.selected_indices.retain(|&i| i < len);
-            if self.editing_text_obj.is_some_and(|i| i >= len) {
-                self.editing_text_obj = None;
-            }
+            self.gizmos_g1
+                .step_counter
+                .sync_with_objects(&self.session.page.capture_objects);
+            self.simplify_ui.sync_from_session(&self.session);
             self.magic_wand.clear_selection();
             self.status_message = "Undid last action (Ctrl+Z)".to_string();
             true
@@ -533,11 +564,17 @@ impl EditorShellState {
         }
     }
 
-    /// Execute Redo (`Ctrl+Y` / `Ctrl+Shift+Z`), keeping selection indices consistent.
+    /// Execute Redo (`Ctrl+Y` / `Ctrl+Shift+Z`), keeping selection indices & Step numbering consistent.
     pub fn perform_redo(&mut self) -> bool {
+        self.finish_text_editing();
+        self.active_drag = None;
         if self.session.redo() {
             let len = self.session.page.capture_objects.len();
             self.gizmos_g1.selected_indices.retain(|&i| i < len);
+            self.gizmos_g1
+                .step_counter
+                .sync_with_objects(&self.session.page.capture_objects);
+            self.simplify_ui.sync_from_session(&self.session);
             self.magic_wand.clear_selection();
             self.status_message = "Redid action (Ctrl+Y)".to_string();
             true
@@ -547,31 +584,736 @@ impl EditorShellState {
     }
 
     pub fn start_editing_text_object(&mut self, obj_idx: usize) {
+        self.start_editing_text_object_with_baseline(obj_idx, false);
+    }
+
+    fn start_editing_text_object_with_baseline(&mut self, obj_idx: usize, is_new_object: bool) {
+        if self.editing_text_obj.is_some() && self.editing_text_obj != Some(obj_idx) {
+            self.finish_text_editing();
+        }
         if let Some(obj) = self.session.page.capture_objects.get(obj_idx).cloned() {
             self.inline_text.style.font_size_pt = Some(self.font_size);
             self.inline_text.load_from_object(obj_idx, &obj);
             self.editing_text_obj = Some(obj_idx);
+            self.editing_text_baseline = Some(if is_new_object {
+                TextEditBaseline::NewObject
+            } else {
+                TextEditBaseline::ExistingObject(obj)
+            });
             self.gizmos_g1.selected_indices = vec![obj_idx];
             self.status_message =
                 "Typing text — Enter for new line, Esc or click outside to finish".to_string();
         }
     }
 
+    /// Sync inline text changes to `session` in real time **without** pushing one Undo step per keystroke.
     pub fn sync_active_text_to_session(&mut self) {
         if let Some(idx) = self.editing_text_obj {
             if let Some(mut obj) = self.session.page.capture_objects.get(idx).cloned() {
                 self.inline_text.style.font_size_pt = Some(self.font_size);
                 self.inline_text.sync_to_object(&mut obj);
-                self.session.update_object(idx, obj);
+                self.session.set_object_unrecorded(idx, obj.clone());
+                if matches!(self.editing_text_baseline, Some(TextEditBaseline::NewObject)) {
+                    let _ = self.session.history.update_top_added_object(idx, obj);
+                }
             }
         }
     }
 
+    /// Commit inline text editing as a single Undo step (when editing an existing object) and exit edit mode.
     pub fn finish_text_editing(&mut self) {
-        if self.editing_text_obj.is_some() {
-            self.sync_active_text_to_session();
-            self.editing_text_obj = None;
+        let Some(idx) = self.editing_text_obj else {
+            self.editing_text_baseline = None;
+            return;
+        };
+        self.sync_active_text_to_session();
+        if let Some(TextEditBaseline::ExistingObject(before)) = self.editing_text_baseline.take() {
+            if let Some(after) = self.session.page.capture_objects.get(idx).cloned() {
+                if before != after {
+                    self.session.history.push(HistoryCommand::UpdateObject {
+                        index: idx,
+                        before,
+                        after,
+                    });
+                }
+            }
         }
+        self.editing_text_obj = None;
+        self.editing_text_baseline = None;
+    }
+
+    /// Begin an interactive left-mouse gesture on the Editor Canvas (`local_x`, `local_y` relative to canvas well).
+    /// All multi-frame drag gestures mutate live preview state unrecorded and commit **1** atomic Undo entry on [`Self::pointer_up`].
+    pub fn pointer_down(
+        &mut self,
+        local_x: f32,
+        local_y: f32,
+        shift: bool,
+        click_count: usize,
+    ) {
+        let canvas_pt = self.viewport.screen_to_canvas(local_x, local_y);
+        let color = self.selected_color_rgba();
+        let sw = self.stroke_width as f64;
+        let op = self.opacity as f64;
+
+        if self.viewport.space_panning {
+            self.active_drag = Some(CanvasDragOp::Pan {
+                last_screen: (local_x, local_y),
+            });
+            return;
+        }
+
+        // Finish active inline text editing if user clicks outside it
+        if let Some(edit_idx) = self.editing_text_obj {
+            let clicked_inside = self
+                .session
+                .page
+                .capture_objects
+                .get(edit_idx)
+                .is_some_and(|o| hit_test_object(o, canvas_pt, 8.0));
+            if !clicked_inside {
+                self.finish_text_editing();
+            } else {
+                return;
+            }
+        }
+
+        // Interactive Spotlight & Magnify on-canvas Move + 8-Handle Resize
+        if self.side_panel_tab == SidePanelTab::Effects {
+            if let Some((eff_idx, spot_r)) = self.effects_gallery.active_spotlight_rect() {
+                let eff_z = self.viewport.effective_logical_zoom().max(0.05);
+                let tol = (9.0 / eff_z).max(4.0) as f64;
+                let (part, init_rect) = if let Some(hit_p) =
+                    EffectsGalleryState::hit_test_spotlight_gizmo(spot_r, canvas_pt, tol)
+                {
+                    (hit_p, spot_r)
+                } else {
+                    (
+                        EffectGizmoPart::SE,
+                        RectF::new(canvas_pt.x, canvas_pt.y, 24.0, 24.0),
+                    )
+                };
+                self.active_drag = Some(CanvasDragOp::EffectSpotlight {
+                    effect_idx: eff_idx,
+                    part,
+                    start_canvas: canvas_pt,
+                    orig_rect: init_rect,
+                    before_bitmap: self.session.bitmap.clone(),
+                    before_objects: self.session.page.capture_objects.clone(),
+                });
+                return;
+            }
+        }
+
+        match self.active_tool.clone() {
+            ToolMode::Move | ToolMode::SmartMove => {
+                let hit = self
+                    .gizmos_g1
+                    .click_select(&self.session, canvas_pt, 8.0, shift);
+                if click_count >= 2 {
+                    if let Some(h_idx) = hit {
+                        let is_txt = self
+                            .session
+                            .page
+                            .capture_objects
+                            .get(h_idx)
+                            .and_then(|o| o.tool_mode.as_ref())
+                            .is_some_and(|m| matches!(m, ToolMode::Text | ToolMode::Callout));
+                        if is_txt {
+                            self.start_editing_text_object(h_idx);
+                            return;
+                        }
+                    }
+                }
+                let mut smart_move_lift = None;
+                if hit.is_none() && self.smart_move.enabled {
+                    if let Some(det_idx) = self.smart_move.hit_test_at(canvas_pt) {
+                        if let Ok((obj_idx, before_bmp, clipped)) = self
+                            .smart_move
+                            .lift_detected_index_unrecorded(&mut self.session, det_idx)
+                        {
+                            self.gizmos_g1.selected_indices = vec![obj_idx];
+                            smart_move_lift = Some((before_bmp, clipped, obj_idx));
+                            self.status_message =
+                                "Smart Move: lifted UI element & auto-filled background — drag to reposition!"
+                                    .into();
+                        }
+                    }
+                }
+                if !self.gizmos_g1.selected_indices.is_empty() {
+                    let before_objects = if smart_move_lift.is_some() {
+                        Vec::new()
+                    } else {
+                        self.gizmos_g1
+                            .selected_indices
+                            .iter()
+                            .filter_map(|&idx| {
+                                self.session
+                                    .page
+                                    .capture_objects
+                                    .get(idx)
+                                    .cloned()
+                                    .map(|o| (idx, o))
+                            })
+                            .collect()
+                    };
+                    self.active_drag = Some(CanvasDragOp::MoveObject {
+                        last_canvas: canvas_pt,
+                        before_objects,
+                        smart_move_lift,
+                    });
+                }
+            }
+            ToolMode::Shape => {
+                let fill_col = if self.shape_filled {
+                    color
+                } else {
+                    ColorRgba::TRANSPARENT
+                };
+                let mut obj = self.gizmos_g1.build_new_object(
+                    ToolMode::Shape,
+                    canvas_pt,
+                    PointF::new(canvas_pt.x + 4.0, canvas_pt.y + 4.0),
+                    color,
+                    fill_col,
+                    sw,
+                    op,
+                );
+                obj.tool_shape = Some(self.selected_shape_kind.clone());
+                if self.selected_shape_kind == "RoundedRectangle" {
+                    obj.corner_radius_ratio = Some(0.22);
+                }
+                if self.shape_dashed {
+                    obj.dash_type = Some("Dash".to_string());
+                }
+                let idx = self.session.add_object_unrecorded(obj);
+                self.gizmos_g1.selected_indices = vec![idx];
+                self.active_drag = Some(CanvasDragOp::CreateObject {
+                    obj_idx: idx,
+                    origin: canvas_pt,
+                });
+            }
+            ToolMode::Arrow
+            | ToolMode::Line
+            | ToolMode::Step
+            | ToolMode::Pen
+            | ToolMode::Highlighter => {
+                let idx = self.gizmos_g1.create_object_unrecorded(
+                    &mut self.session,
+                    self.active_tool.clone(),
+                    canvas_pt,
+                    PointF::new(canvas_pt.x + 2.0, canvas_pt.y + 2.0),
+                    color,
+                    color,
+                    sw,
+                    op,
+                );
+                self.active_drag = Some(CanvasDragOp::CreateObject {
+                    obj_idx: idx,
+                    origin: canvas_pt,
+                });
+            }
+            ToolMode::Callout | ToolMode::Text => {
+                let existing_hit = self
+                    .session
+                    .page
+                    .capture_objects
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find(|(_, o)| {
+                        matches!(o.tool_mode, Some(ToolMode::Text | ToolMode::Callout))
+                            && hit_test_object(o, canvas_pt, 6.0)
+                    })
+                    .map(|(i, _)| i);
+                if let Some(hit_idx) = existing_hit {
+                    self.start_editing_text_object(hit_idx);
+                } else {
+                    let is_callout = self.active_tool == ToolMode::Callout;
+                    let (fg_c, bg_c, tails) = if is_callout {
+                        (
+                            ColorRgba::rgb(24, 24, 27),
+                            color,
+                            Some(vec![PointF::new(canvas_pt.x + 36.0, canvas_pt.y + 94.0)]),
+                        )
+                    } else {
+                        (color, ColorRgba::TRANSPARENT, None)
+                    };
+                    let obj = CaptureObject {
+                        tool_mode: Some(self.active_tool.clone()),
+                        start_point: Some(canvas_pt),
+                        end_point: Some(PointF::new(canvas_pt.x + 190.0, canvas_pt.y + 64.0)),
+                        tail_points: tails,
+                        foreground_color: Some(fg_c),
+                        background_color: Some(bg_c),
+                        font_size: Some(self.font_size as f64),
+                        stroke_width: Some(if is_callout { sw.max(2.0) } else { 0.0 }),
+                        opacity: Some(op),
+                        ..CaptureObject::default()
+                    };
+                    let idx = self.session.add_object_unrecorded(obj);
+                    self.start_editing_text_object_with_baseline(idx, true);
+                    self.active_drag = Some(CanvasDragOp::CreateObject {
+                        obj_idx: idx,
+                        origin: canvas_pt,
+                    });
+                }
+            }
+            ToolMode::Fill => {
+                let x = canvas_pt.x.round().max(0.0) as u32;
+                let y = canvas_pt.y.round().max(0.0) as u32;
+                let _ = self.raster.apply_flood_fill(&mut self.session, x, y, color);
+            }
+            ToolMode::Eraser => {
+                let before_bitmap = self.session.bitmap.clone();
+                let points = vec![canvas_pt];
+                let _ = self.raster.preview_eraser_stroke_from_base(
+                    &mut self.session,
+                    &before_bitmap,
+                    &points,
+                    ColorRgba::TRANSPARENT,
+                );
+                self.active_drag = Some(CanvasDragOp::EraseStroke {
+                    before_bitmap,
+                    points,
+                });
+            }
+            ToolMode::Blur
+            | ToolMode::Magnify
+            | ToolMode::Crop
+            | ToolMode::CutOut
+            | ToolMode::Selection => {
+                if self.active_tool == ToolMode::Selection {
+                    self.active_selection_rect = None;
+                }
+                self.active_drag = Some(CanvasDragOp::RegionTool {
+                    start: canvas_pt,
+                    current: canvas_pt,
+                });
+            }
+            ToolMode::Stamp => {
+                let mut extra = std::collections::BTreeMap::new();
+                extra.insert(
+                    "StampId".to_string(),
+                    serde_json::Value::String(self.selected_stamp_id.clone()),
+                );
+                let obj = CaptureObject {
+                    tool_mode: Some(ToolMode::Stamp),
+                    tool_shape: Some(self.selected_stamp_id.clone()),
+                    start_point: Some(PointF::new(
+                        (canvas_pt.x - 28.0).max(0.0),
+                        (canvas_pt.y - 28.0).max(0.0),
+                    )),
+                    end_point: Some(PointF::new(canvas_pt.x + 28.0, canvas_pt.y + 28.0)),
+                    foreground_color: Some(color),
+                    stroke_width: Some(sw),
+                    opacity: Some(op),
+                    drop_shadow_enabled: Some(true),
+                    extra,
+                    ..CaptureObject::default()
+                };
+                let idx = self.session.add_object_unrecorded(obj);
+                self.gizmos_g1.selected_indices = vec![idx];
+                self.active_drag = Some(CanvasDragOp::CreateObject {
+                    obj_idx: idx,
+                    origin: canvas_pt,
+                });
+                self.status_message = format!("Placed Stamp `{}`", self.selected_stamp_id);
+            }
+            ToolMode::Eyedropper => {
+                let x = canvas_pt.x.round().max(0.0) as u32;
+                let y = canvas_pt.y.round().max(0.0) as u32;
+                let _ = self.pick_canvas_color(x, y);
+            }
+            ToolMode::MagicWand => {
+                let x = canvas_pt.x.round().max(0.0) as u32;
+                let y = canvas_pt.y.round().max(0.0) as u32;
+                let count = self.magic_wand.select_at(&self.session, x, y);
+                self.status_message = format!(
+                    "Magic Wand selected {count} px — press Delete to clear or use Properties"
+                );
+            }
+            ToolMode::Simplify => {
+                self.active_drag = Some(CanvasDragOp::RegionTool {
+                    start: canvas_pt,
+                    current: canvas_pt,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// Update an active mouse gesture or hover state; returns `true` when the view should repaint.
+    pub fn pointer_move(&mut self, local_x: f32, local_y: f32) -> bool {
+        let is_brush_tool = matches!(
+            self.active_tool,
+            ToolMode::Pen | ToolMode::Highlighter | ToolMode::Eraser
+        );
+        let has_spot_gizmo = self.side_panel_tab == SidePanelTab::Effects
+            && self.effects_gallery.active_spotlight_rect().is_some();
+        if is_brush_tool || has_spot_gizmo {
+            self.hover_local_pos = Some((local_x, local_y));
+        } else if self.hover_local_pos.is_some() {
+            self.hover_local_pos = None;
+        }
+
+        let Some(drag) = self.active_drag.clone() else {
+            let mut needs_redraw = is_brush_tool || has_spot_gizmo;
+            if matches!(self.active_tool, ToolMode::Move | ToolMode::SmartMove)
+                && self.smart_move.enabled
+            {
+                let hover_pt = self.viewport.screen_to_canvas(local_x, local_y);
+                let next_hover = self.smart_move.hit_test_at(hover_pt);
+                if self.smart_move.hovered_idx != next_hover {
+                    self.smart_move.hovered_idx = next_hover;
+                    needs_redraw = true;
+                }
+            }
+            return needs_redraw;
+        };
+
+        let canvas_pt = self.viewport.screen_to_canvas(local_x, local_y);
+
+        match drag {
+            CanvasDragOp::Pan { last_screen } => {
+                self.viewport
+                    .pan_by(local_x - last_screen.0, local_y - last_screen.1);
+                self.active_drag = Some(CanvasDragOp::Pan {
+                    last_screen: (local_x, local_y),
+                });
+            }
+            CanvasDragOp::CreateObject { obj_idx, origin } => {
+                if matches!(self.active_tool, ToolMode::Pen | ToolMode::Highlighter) {
+                    self.gizmos_g1.append_stroke_point_unrecorded(
+                        &mut self.session,
+                        obj_idx,
+                        canvas_pt,
+                    );
+                } else if let Some(mut obj) =
+                    self.session.page.capture_objects.get(obj_idx).cloned()
+                {
+                    let drag_dist = (canvas_pt.x - origin.x).hypot(canvas_pt.y - origin.y);
+                    let min_drag_met = (canvas_pt.x - origin.x).abs() >= 12.0
+                        || (canvas_pt.y - origin.y).abs() >= 12.0;
+
+                    match obj.tool_mode {
+                        Some(ToolMode::Step) => {
+                            if drag_dist >= 12.0 {
+                                let r = drag_dist.clamp(12.0, 120.0);
+                                obj.start_point = Some(PointF::new(origin.x - r, origin.y - r));
+                                obj.end_point = Some(PointF::new(origin.x + r, origin.y + r));
+                            }
+                        }
+                        Some(ToolMode::Stamp) => {
+                            if min_drag_met {
+                                obj.start_point = Some(origin);
+                                obj.end_point = Some(canvas_pt);
+                            }
+                        }
+                        Some(ToolMode::Text | ToolMode::Callout) => {
+                            if min_drag_met {
+                                obj.end_point = Some(canvas_pt);
+                                if obj.tool_mode == Some(ToolMode::Callout) {
+                                    let r = RectF::from_points(origin, canvas_pt);
+                                    obj.tail_points = Some(vec![PointF::new(
+                                        r.x + r.width * 0.25,
+                                        r.y + r.height + 28.0,
+                                    )]);
+                                }
+                            }
+                        }
+                        Some(ToolMode::Arrow) => {
+                            obj.end_point = Some(canvas_pt);
+                            obj.points_array = Some(vec![
+                                origin,
+                                PointF::new(
+                                    (origin.x + canvas_pt.x) * 0.5,
+                                    (origin.y + canvas_pt.y) * 0.5,
+                                ),
+                                canvas_pt,
+                            ]);
+                        }
+                        _ => {
+                            obj.end_point = Some(canvas_pt);
+                        }
+                    }
+                    self.session.set_object_unrecorded(obj_idx, obj);
+                }
+            }
+            CanvasDragOp::MoveObject {
+                last_canvas,
+                before_objects,
+                smart_move_lift,
+            } => {
+                let dx = canvas_pt.x - last_canvas.x;
+                let dy = canvas_pt.y - last_canvas.y;
+                self.gizmos_g1
+                    .translate_selected_unrecorded(&mut self.session, dx, dy);
+                self.active_drag = Some(CanvasDragOp::MoveObject {
+                    last_canvas: canvas_pt,
+                    before_objects,
+                    smart_move_lift,
+                });
+            }
+            CanvasDragOp::EraseStroke {
+                before_bitmap,
+                mut points,
+            } => {
+                let moved_enough = points
+                    .last()
+                    .map_or(true, |prev| (canvas_pt.x - prev.x).hypot(canvas_pt.y - prev.y) >= 0.5);
+                if moved_enough {
+                    points.push(canvas_pt);
+                    let _ = self.raster.preview_eraser_stroke_from_base(
+                        &mut self.session,
+                        &before_bitmap,
+                        &points,
+                        ColorRgba::TRANSPARENT,
+                    );
+                }
+                self.active_drag = Some(CanvasDragOp::EraseStroke {
+                    before_bitmap,
+                    points,
+                });
+            }
+            CanvasDragOp::RegionTool { start, .. } => {
+                self.active_drag = Some(CanvasDragOp::RegionTool {
+                    start,
+                    current: canvas_pt,
+                });
+            }
+            CanvasDragOp::EffectSpotlight {
+                effect_idx,
+                part,
+                start_canvas,
+                orig_rect,
+                ..
+            } => {
+                let (bw, bh) = self.effects_gallery.base_dimensions(&self.session);
+                let next_r = EffectsGalleryState::drag_spotlight_rect(
+                    orig_rect,
+                    part,
+                    canvas_pt.x - start_canvas.x,
+                    canvas_pt.y - start_canvas.y,
+                    bw,
+                    bh,
+                );
+                if let Some(EffectConfig::SpotlightAndMagnify {
+                    dim_opacity,
+                    blur_radius,
+                    magnify_scale,
+                    ..
+                }) = self
+                    .effects_gallery
+                    .entries
+                    .get(effect_idx)
+                    .map(|e| e.config.clone())
+                {
+                    self.effects_gallery.update_effect_config(
+                        &mut self.session,
+                        effect_idx,
+                        EffectConfig::SpotlightAndMagnify {
+                            x: next_r.x,
+                            y: next_r.y,
+                            width: next_r.width,
+                            height: next_r.height,
+                            dim_opacity,
+                            blur_radius,
+                            magnify_scale,
+                        },
+                        false,
+                    );
+                    self.status_message = format!(
+                        "Spotlight: ({:.0}, {:.0}) · {:.0}×{:.0} px",
+                        next_r.x, next_r.y, next_r.width, next_r.height
+                    );
+                }
+            }
+        }
+        true
+    }
+
+    /// Finish an active left-mouse gesture, committing **at most one** atomic [`HistoryCommand`].
+    pub fn pointer_up(&mut self) {
+        if let Some(drag) = self.active_drag.take() {
+            match drag {
+                CanvasDragOp::CreateObject { obj_idx, .. } => {
+                    if let Some(object) = self.session.page.capture_objects.get(obj_idx).cloned() {
+                        self.session
+                            .history
+                            .push(HistoryCommand::AddObject { index: obj_idx, object });
+                    }
+                }
+                CanvasDragOp::MoveObject {
+                    before_objects,
+                    smart_move_lift,
+                    ..
+                } => {
+                    if let Some((before_bmp, clipped, obj_idx)) = smart_move_lift {
+                        if let Some(object) =
+                            self.session.page.capture_objects.get(obj_idx).cloned()
+                        {
+                            let after_bmp = self.session.bitmap.clone();
+                            self.session.history.push(HistoryCommand::Batch(vec![
+                                HistoryCommand::RasterSnapshot {
+                                    before: before_bmp,
+                                    after: after_bmp,
+                                    dirty_rect: clipped,
+                                },
+                                HistoryCommand::AddObject {
+                                    index: obj_idx,
+                                    object,
+                                },
+                            ]));
+                        }
+                    } else {
+                        let mut updates = Vec::new();
+                        for (idx, before) in before_objects {
+                            if let Some(after) = self.session.page.capture_objects.get(idx).cloned()
+                            {
+                                if before != after {
+                                    updates.push(HistoryCommand::UpdateObject {
+                                        index: idx,
+                                        before,
+                                        after,
+                                    });
+                                }
+                            }
+                        }
+                        if updates.len() == 1 {
+                            self.session.history.push(updates.pop().expect("len == 1"));
+                        } else if updates.len() > 1 {
+                            self.session.history.push(HistoryCommand::Batch(updates));
+                        }
+                    }
+                }
+                CanvasDragOp::EraseStroke {
+                    before_bitmap,
+                    points,
+                } => {
+                    if let Some(dirty_rect) = self.raster.preview_eraser_stroke_from_base(
+                        &mut self.session,
+                        &before_bitmap,
+                        &points,
+                        ColorRgba::TRANSPARENT,
+                    ) {
+                        let after = self.session.bitmap.clone();
+                        if before_bitmap != after {
+                            self.session.history.push(HistoryCommand::RasterSnapshot {
+                                before: before_bitmap,
+                                after,
+                                dirty_rect,
+                            });
+                        }
+                    }
+                }
+                CanvasDragOp::EffectSpotlight {
+                    before_bitmap,
+                    before_objects,
+                    ..
+                } => {
+                    if self.session.bitmap != before_bitmap {
+                        let after_bitmap = self.session.bitmap.clone();
+                        let after_objects = self.session.page.capture_objects.clone();
+                        self.session.history.push(HistoryCommand::CanvasResize {
+                            before_bitmap,
+                            after_bitmap,
+                            before_objects,
+                            after_objects,
+                        });
+                    }
+                }
+                CanvasDragOp::RegionTool { start, current } => {
+                    let cw_max = self.session.bitmap.width().max(1) as f64;
+                    let ch_max = self.session.bitmap.height().max(1) as f64;
+                    let x = start.x.min(current.x).clamp(0.0, cw_max - 1.0);
+                    let y = start.y.min(current.y).clamp(0.0, ch_max - 1.0);
+                    let x1 = start.x.max(current.x).clamp(x + 1.0, cw_max);
+                    let y1 = start.y.max(current.y).clamp(y + 1.0, ch_max);
+                    let w = x1 - x;
+                    let h = y1 - y;
+                    if w >= 4.0 && h >= 4.0 {
+                        let rect = RectF::new(x, y, w, h);
+                        match self.active_tool {
+                            ToolMode::Blur => {
+                                self.raster.place_blur_region(&mut self.session, rect);
+                                self.status_message =
+                                    format!("Blurred {:.0}×{:.0} px region", w, h);
+                            }
+                            ToolMode::Magnify => {
+                                self.raster.place_magnify_region(&mut self.session, rect);
+                                self.status_message =
+                                    format!("Magnified {:.0}×{:.0} px region", w, h);
+                            }
+                            ToolMode::Crop => {
+                                self.pending_crop_rect = Some(rect);
+                                self.status_message = format!(
+                                    "Crop {:.0}×{:.0} px ready — click ✓ Crop or press Enter",
+                                    w, h
+                                );
+                            }
+                            ToolMode::CutOut => {
+                                if w >= h {
+                                    self.raster.cutout.orientation = CutOutOrientation::Horizontal;
+                                    self.raster.cutout.start = y.round().max(0.0) as u32;
+                                    self.raster.cutout.end = (y + h).round().max(1.0) as u32;
+                                } else {
+                                    self.raster.cutout.orientation = CutOutOrientation::Vertical;
+                                    self.raster.cutout.start = x.round().max(0.0) as u32;
+                                    self.raster.cutout.end = (x + w).round().max(1.0) as u32;
+                                }
+                                if self.raster.apply_cut_out(&mut self.session) {
+                                    self.status_message = "Applied Cut Out strip".to_string();
+                                }
+                            }
+                            ToolMode::Selection => {
+                                self.active_selection_rect = Some(rect);
+                                self.raster.selection_points =
+                                    vec![PointF::new(x, y), PointF::new(x + w, y + h)];
+                                self.status_message = format!(
+                                    "Selected {:.0}×{:.0} px (Del to clear, Ctrl+C to copy)",
+                                    w, h
+                                );
+                            }
+                            ToolMode::Simplify => {
+                                let fill_col = self
+                                    .simplify_ui
+                                    .palette
+                                    .palette_colors
+                                    .first()
+                                    .copied()
+                                    .unwrap_or_else(|| self.active_color_rgba());
+                                let obj = CaptureObject {
+                                    tool_mode: Some(ToolMode::Simplify),
+                                    start_point: Some(PointF::new(x, y)),
+                                    end_point: Some(PointF::new(x + w, y + h)),
+                                    background_color: Some(fill_col),
+                                    foreground_color: Some(ColorRgba::TRANSPARENT),
+                                    stroke_width: Some(0.0),
+                                    corner_radius_ratio: Some(0.12),
+                                    opacity: Some(100.0),
+                                    ..CaptureObject::default()
+                                };
+                                let idx = self.session.add_object(obj);
+                                self.gizmos_g1.selected_indices = vec![idx];
+                                self.status_message = format!(
+                                    "Placed {:.0}×{:.0} px Simplify block (Ctrl+Z to undo)",
+                                    w, h
+                                );
+                            }
+                            _ => {}
+                        }
+                    } else if self.active_tool == ToolMode::Selection {
+                        if self.active_selection_rect.take().is_some() {
+                            self.raster.selection_points.clear();
+                            self.status_message = "Selection cleared".to_string();
+                        }
+                    }
+                }
+                CanvasDragOp::Pan { .. } => {}
+            }
+        }
+        self.viewport.active_guides.clear();
     }
 
     /// Confirm and execute `pending_crop_rect` (triggered by `✓ Crop` button or `Enter` key).
@@ -756,10 +1498,17 @@ impl EditorShellState {
             .and_then(make_tray_thumb_from_png_bytes)
             .or_else(|| make_tray_thumb_from_bitmap(&bmp));
 
+        self.finish_text_editing();
+        self.active_drag = None;
         self.video_player.close_video();
         self.effects_gallery.reset_for_new_document(dims.0, dims.1);
         self.applied_effects_count = 0;
         self.session = DocumentSession::new(first.page.clone(), bmp);
+        self.gizmos_g1
+            .step_counter
+            .sync_with_objects(&self.session.page.capture_objects);
+        self.simplify_ui.sync_from_session(&self.session);
+        self.magic_wand.clear_selection();
         self.viewport.fit_canvas(dims.0, dims.1);
         self.zoom_percent = self.viewport.zoom_percent();
         self.pending_fit_canvas = true;
@@ -789,6 +1538,7 @@ impl EditorShellState {
 
     /// Save the active `DocumentSession` to a `.snagx` archive (with regenerated thumbnail PNG).
     pub fn save_snagx(&mut self, path: &Path) -> Result<(), String> {
+        self.finish_text_editing();
         let bg_png = self
             .session
             .bitmap
@@ -917,10 +1667,17 @@ impl EditorShellState {
             capture_objects: objects,
             ..SnagxPage::default()
         };
+        self.finish_text_editing();
+        self.active_drag = None;
         self.video_player.close_video();
         self.effects_gallery.reset_for_new_document(w, h);
         self.applied_effects_count = 0;
         self.session = DocumentSession::new(page.clone(), bmp.clone());
+        self.gizmos_g1
+            .step_counter
+            .sync_with_objects(&self.session.page.capture_objects);
+        self.simplify_ui.sync_from_session(&self.session);
+        self.magic_wand.clear_selection();
         self.viewport.fit_canvas(w, h);
         self.zoom_percent = self.viewport.zoom_percent();
         self.pending_fit_canvas = true;
@@ -1092,10 +1849,15 @@ impl EditorShellState {
             capture_background_color: Some(ColorRgba::WHITE),
             ..SnagxPage::default()
         };
+        self.finish_text_editing();
+        self.active_drag = None;
         self.video_player.close_video();
         self.effects_gallery.reset_for_new_document(w, h);
         self.applied_effects_count = 0;
         self.session = DocumentSession::new(page, bmp);
+        self.gizmos_g1.step_counter.sync_with_objects(&[]);
+        self.simplify_ui.sync_from_session(&self.session);
+        self.magic_wand.clear_selection();
         self.active_path = None;
         self.viewport.fit_canvas(w, h);
         self.zoom_percent = self.viewport.zoom_percent();
@@ -4692,7 +5454,9 @@ impl Render for EditorShellView {
                 let ctrl = ev.keystroke.modifiers.control;
 
                 if this.state.editing_text_obj.is_some() {
-                    match key {
+                    let shift = ev.keystroke.modifiers.shift;
+                    let key_lower = key.to_ascii_lowercase();
+                    match key_lower.as_str() {
                         "escape" => {
                             this.state.finish_text_editing();
                             cx.stop_propagation();
@@ -4740,6 +5504,24 @@ impl Render for EditorShellView {
                             this.state.inline_text.select_all();
                             cx.stop_propagation();
                             cx.notify();
+                        }
+                        "z" if ctrl && shift => {
+                            if this.state.perform_redo() {
+                                cx.stop_propagation();
+                                cx.notify();
+                            }
+                        }
+                        "z" if ctrl => {
+                            if this.state.perform_undo() {
+                                cx.stop_propagation();
+                                cx.notify();
+                            }
+                        }
+                        "y" if ctrl => {
+                            if this.state.perform_redo() {
+                                cx.stop_propagation();
+                                cx.notify();
+                            }
                         }
                         _ => {}
                     }
@@ -4880,13 +5662,7 @@ impl Render for EditorShellView {
                             let _ = this.state.delete_selected_region();
                             cx.notify();
                         } else if !this.state.gizmos_g1.selected_indices.is_empty() {
-                            let mut indices = this.state.gizmos_g1.selected_indices.clone();
-                            indices.sort_unstable();
-                            indices.dedup();
-                            for &idx in indices.iter().rev() {
-                                let _ = this.state.session.delete_object(idx);
-                            }
-                            this.state.gizmos_g1.selected_indices.clear();
+                            this.state.gizmos_g1.delete_selected(&mut this.state.session);
                             this.state.status_message = "Deleted selected object(s)".to_string();
                             cx.notify();
                         }
@@ -4979,666 +5755,43 @@ impl Render for EditorShellView {
                                 .overflow_hidden()
                                 .cursor(canvas_cursor)
                                 .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
-                                    this.state.close_all_popovers();
-                                    fh_for_canvas.focus(window, cx);
-
-                                    let (ox, oy) = this.canvas_origin.get();
-                                    let sx: f32 = ev.position.x.into();
-                                    let sy: f32 = ev.position.y.into();
-                                    let local_x = (sx - ox).max(0.0);
-                                    let local_y = (sy - oy).max(0.0);
-                                    let canvas_pt =
-                                        this.state.viewport.screen_to_canvas(local_x, local_y);
-                                    let color = this.state.selected_color_rgba();
-                                    let sw = this.state.stroke_width as f64;
-                                    let op = this.state.opacity as f64;
-
-                                    if this.state.viewport.space_panning {
-                                        this.state.active_drag = Some(CanvasDragOp::Pan {
-                                            last_screen: (local_x, local_y),
-                                        });
-                                        return;
-                                    }
-
-                                    // Finish active inline text editing if user clicks outside it
-                                    if let Some(edit_idx) = this.state.editing_text_obj {
-                                        let clicked_inside = this
-                                            .state
-                                            .session
-                                            .page
-                                            .capture_objects
-                                            .get(edit_idx)
-                                            .is_some_and(|o| hit_test_object(o, canvas_pt, 8.0));
-                                        if !clicked_inside {
-                                            this.state.finish_text_editing();
-                                        } else {
-                                            cx.notify();
-                                            return;
-                                        }
-                                    }
-
-                                    // Interactive Spotlight & Magnify on-canvas Move + 8-Handle Resize!
-                                    if this.state.side_panel_tab == SidePanelTab::Effects {
-                                        if let Some((eff_idx, spot_r)) =
-                                            this.state.effects_gallery.active_spotlight_rect()
-                                        {
-                                            let eff_z = this
-                                                .state
-                                                .viewport
-                                                .effective_logical_zoom()
-                                                .max(0.05);
-                                            let tol = (9.0 / eff_z).max(4.0) as f64;
-                                            let (part, init_rect) = if let Some(hit_p) =
-                                                EffectsGalleryState::hit_test_spotlight_gizmo(
-                                                    spot_r, canvas_pt, tol,
-                                                ) {
-                                                (hit_p, spot_r)
-                                            } else {
-                                                // Dragging outside draws a new Spotlight region from `canvas_pt`
-                                                (
-                                                    EffectGizmoPart::SE,
-                                                    RectF::new(canvas_pt.x, canvas_pt.y, 24.0, 24.0),
-                                                )
-                                            };
-                                            this.state.active_drag =
-                                                Some(CanvasDragOp::EffectSpotlight {
-                                                    effect_idx: eff_idx,
-                                                    part,
-                                                    start_canvas: canvas_pt,
-                                                    orig_rect: init_rect,
-                                                });
-                                            cx.notify();
-                                            return;
-                                        }
-                                    }
-
-                                    match this.state.active_tool.clone() {
-                                        ToolMode::Move | ToolMode::SmartMove => {
-                                            let hit = this.state.gizmos_g1.click_select(
-                                                &this.state.session,
-                                                canvas_pt,
-                                                8.0,
-                                                ev.modifiers.shift,
-                                            );
-                                            if ev.click_count >= 2 {
-                                                if let Some(h_idx) = hit {
-                                                    let is_txt = this
-                                                        .state
-                                                        .session
-                                                        .page
-                                                        .capture_objects
-                                                        .get(h_idx)
-                                                        .and_then(|o| o.tool_mode.as_ref())
-                                                        .is_some_and(|m| {
-                                                            matches!(
-                                                                m,
-                                                                ToolMode::Text | ToolMode::Callout
-                                                            )
-                                                        });
-                                                    if is_txt {
-                                                        this.state.start_editing_text_object(h_idx);
-                                                        cx.notify();
-                                                        return;
-                                                    }
-                                                }
-                                            }
-                                            if hit.is_none() && this.state.smart_move.enabled {
-                                                if let Some(det_idx) =
-                                                    this.state.smart_move.hit_test_at(canvas_pt)
-                                                {
-                                                    if let Ok(obj_idx) = this
-                                                        .state
-                                                        .smart_move
-                                                        .lift_detected_index(
-                                                            &mut this.state.session,
-                                                            det_idx,
-                                                        )
-                                                    {
-                                                        this.state.gizmos_g1.selected_indices =
-                                                            vec![obj_idx];
-                                                        this.state.status_message =
-                                                            "Smart Move: lifted UI element & auto-filled background — drag to reposition!"
-                                                                .into();
-                                                    }
-                                                }
-                                            }
-                                            if !this.state.gizmos_g1.selected_indices.is_empty() {
-                                                this.state.active_drag =
-                                                    Some(CanvasDragOp::MoveObject {
-                                                        last_canvas: canvas_pt,
-                                                    });
-                                            }
-                                        }
-                                        ToolMode::Shape => {
-                                            let fill_col = if this.state.shape_filled {
-                                                color
-                                            } else {
-                                                ColorRgba::TRANSPARENT
-                                            };
-                                            let idx = this.state.gizmos_g1.create_object(
-                                                &mut this.state.session,
-                                                ToolMode::Shape,
-                                                canvas_pt,
-                                                PointF::new(canvas_pt.x + 4.0, canvas_pt.y + 4.0),
-                                                color,
-                                                fill_col,
-                                                sw,
-                                                op,
-                                            );
-                                            if let Some(mut obj) = this
-                                                .state
-                                                .session
-                                                .page
-                                                .capture_objects
-                                                .get(idx)
-                                                .cloned()
-                                            {
-                                                obj.tool_shape =
-                                                    Some(this.state.selected_shape_kind.clone());
-                                                if this.state.selected_shape_kind
-                                                    == "RoundedRectangle"
-                                                {
-                                                    obj.corner_radius_ratio = Some(0.22);
-                                                }
-                                                if this.state.shape_dashed {
-                                                    obj.dash_type = Some("Dash".to_string());
-                                                }
-                                                this.state.session.update_object(idx, obj);
-                                            }
-                                            this.state.active_drag =
-                                                Some(CanvasDragOp::CreateObject { obj_idx: idx });
-                                        }
-                                        ToolMode::Arrow
-                                        | ToolMode::Line
-                                        | ToolMode::Step
-                                        | ToolMode::Pen
-                                        | ToolMode::Highlighter => {
-                                            let idx = this.state.gizmos_g1.create_object(
-                                                &mut this.state.session,
-                                                this.state.active_tool.clone(),
-                                                canvas_pt,
-                                                PointF::new(canvas_pt.x + 2.0, canvas_pt.y + 2.0),
-                                                color,
-                                                color,
-                                                sw,
-                                                op,
-                                            );
-                                            this.state.active_drag =
-                                                Some(CanvasDragOp::CreateObject { obj_idx: idx });
-                                        }
-                                        ToolMode::Callout | ToolMode::Text => {
-                                            // Clicking an existing Text/Callout edits it directly!
-                                            let existing_hit = this
-                                                .state
-                                                .session
-                                                .page
-                                                .capture_objects
-                                                .iter()
-                                                .enumerate()
-                                                .rev()
-                                                .find(|(_, o)| {
-                                                    matches!(
-                                                        o.tool_mode,
-                                                        Some(ToolMode::Text | ToolMode::Callout)
-                                                    ) && hit_test_object(o, canvas_pt, 6.0)
-                                                })
-                                                .map(|(i, _)| i);
-                                            if let Some(hit_idx) = existing_hit {
-                                                this.state.start_editing_text_object(hit_idx);
-                                            } else {
-                                                let is_callout =
-                                                    this.state.active_tool == ToolMode::Callout;
-                                                let (fg_c, bg_c, tails) = if is_callout {
-                                                    (
-                                                        ColorRgba::rgb(24, 24, 27),
-                                                        color,
-                                                        Some(vec![PointF::new(
-                                                            canvas_pt.x + 36.0,
-                                                            canvas_pt.y + 94.0,
-                                                        )]),
-                                                    )
-                                                } else {
-                                                    (color, ColorRgba::TRANSPARENT, None)
-                                                };
-                                                let obj = CaptureObject {
-                                                    tool_mode: Some(this.state.active_tool.clone()),
-                                                    start_point: Some(canvas_pt),
-                                                    end_point: Some(PointF::new(
-                                                        canvas_pt.x + 190.0,
-                                                        canvas_pt.y + 64.0,
-                                                    )),
-                                                    tail_points: tails,
-                                                    foreground_color: Some(fg_c),
-                                                    background_color: Some(bg_c),
-                                                    font_size: Some(this.state.font_size as f64),
-                                                    stroke_width: Some(if is_callout {
-                                                        sw.max(2.0)
-                                                    } else {
-                                                        0.0
-                                                    }),
-                                                    opacity: Some(op),
-                                                    ..CaptureObject::default()
-                                                };
-                                                let idx = this.state.session.add_object(obj);
-                                                this.state.start_editing_text_object(idx);
-                                                this.state.active_drag =
-                                                    Some(CanvasDragOp::CreateObject {
-                                                        obj_idx: idx,
-                                                    });
-                                            }
-                                        }
-                                        ToolMode::Fill => {
-                                            let x = canvas_pt.x.round().max(0.0) as u32;
-                                            let y = canvas_pt.y.round().max(0.0) as u32;
-                                            let _ = this.state.raster.apply_flood_fill(
-                                                &mut this.state.session,
-                                                x,
-                                                y,
-                                                color,
-                                            );
-                                        }
-                                        ToolMode::Eraser => {
-                                            this.state.active_drag =
-                                                Some(CanvasDragOp::EraseStroke {
-                                                    points: vec![canvas_pt],
-                                                });
-                                        }
-                                        ToolMode::Blur
-                                        | ToolMode::Magnify
-                                        | ToolMode::Crop
-                                        | ToolMode::CutOut
-                                        | ToolMode::Selection => {
-                                            if this.state.active_tool == ToolMode::Selection {
-                                                this.state.active_selection_rect = None;
-                                            }
-                                            this.state.active_drag =
-                                                Some(CanvasDragOp::RegionTool {
-                                                    start: canvas_pt,
-                                                    current: canvas_pt,
-                                                });
-                                        }
-                                        ToolMode::Stamp => {
-                                            let mut extra = std::collections::BTreeMap::new();
-                                            extra.insert(
-                                                "StampId".to_string(),
-                                                serde_json::Value::String(
-                                                    this.state.selected_stamp_id.clone(),
-                                                ),
-                                            );
-                                            let obj = CaptureObject {
-                                                tool_mode: Some(ToolMode::Stamp),
-                                                tool_shape: Some(
-                                                    this.state.selected_stamp_id.clone(),
-                                                ),
-                                                start_point: Some(PointF::new(
-                                                    (canvas_pt.x - 28.0).max(0.0),
-                                                    (canvas_pt.y - 28.0).max(0.0),
-                                                )),
-                                                end_point: Some(PointF::new(
-                                                    canvas_pt.x + 28.0,
-                                                    canvas_pt.y + 28.0,
-                                                )),
-                                                foreground_color: Some(color),
-                                                stroke_width: Some(sw),
-                                                opacity: Some(op),
-                                                drop_shadow_enabled: Some(true),
-                                                extra,
-                                                ..CaptureObject::default()
-                                            };
-                                            let idx = this.state.session.add_object(obj);
-                                            this.state.gizmos_g1.selected_indices = vec![idx];
-                                            this.state.active_drag =
-                                                Some(CanvasDragOp::CreateObject { obj_idx: idx });
-                                            this.state.status_message = format!(
-                                                "Placed Stamp `{}`",
-                                                this.state.selected_stamp_id
-                                            );
-                                        }
-                                        ToolMode::Eyedropper => {
-                                            let x = canvas_pt.x.round().max(0.0) as u32;
-                                            let y = canvas_pt.y.round().max(0.0) as u32;
-                                            let _ = this.state.pick_canvas_color(x, y);
-                                        }
-                                        ToolMode::MagicWand => {
-                                            let x = canvas_pt.x.round().max(0.0) as u32;
-                                            let y = canvas_pt.y.round().max(0.0) as u32;
-                                            let count = this
-                                                .state
-                                                .magic_wand
-                                                .select_at(&this.state.session, x, y);
-                                            this.state.status_message = format!(
-                                                "Magic Wand selected {count} px — press Delete to clear or use Properties"
-                                            );
-                                        }
-                                        ToolMode::Simplify => {
-                                            this.state.active_drag = Some(CanvasDragOp::RegionTool {
-                                                start: canvas_pt,
-                                                current: canvas_pt,
-                                            });
-                                        }
-                                        _ => {}
-                                    }
-                                    cx.notify();
-                                }),
-                            )
-                            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _window, cx| {
-                                let (ox, oy) = this.canvas_origin.get();
-                                let sx: f32 = ev.position.x.into();
-                                let sy: f32 = ev.position.y.into();
-                                let local_x = (sx - ox).max(0.0);
-                                let local_y = (sy - oy).max(0.0);
-                                let is_brush_tool = matches!(
-                                    this.state.active_tool,
-                                    ToolMode::Pen | ToolMode::Highlighter | ToolMode::Eraser
-                                );
-                                let has_spot_gizmo = this.state.side_panel_tab
-                                    == SidePanelTab::Effects
-                                    && this
-                                        .state
-                                        .effects_gallery
-                                        .active_spotlight_rect()
-                                        .is_some();
-                                if is_brush_tool || has_spot_gizmo {
-                                    this.state.hover_local_pos = Some((local_x, local_y));
-                                } else if this.state.hover_local_pos.is_some() {
-                                    this.state.hover_local_pos = None;
-                                }
-
-                                let Some(drag) = this.state.active_drag.clone() else {
-                                    let mut needs_redraw = is_brush_tool || has_spot_gizmo;
-                                    if matches!(
-                                        this.state.active_tool,
-                                        ToolMode::Move | ToolMode::SmartMove
-                                    ) && this.state.smart_move.enabled
-                                    {
-                                        let hover_pt =
-                                            this.state.viewport.screen_to_canvas(local_x, local_y);
-                                        let next_hover = this.state.smart_move.hit_test_at(hover_pt);
-                                        if this.state.smart_move.hovered_idx != next_hover {
-                                            this.state.smart_move.hovered_idx = next_hover;
-                                            needs_redraw = true;
-                                        }
-                                    }
-                                    if needs_redraw {
+                                    MouseButton::Left,
+                                    cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                                        this.state.close_all_popovers();
+                                        fh_for_canvas.focus(window, cx);
+                                        let (ox, oy) = this.canvas_origin.get();
+                                        let sx: f32 = ev.position.x.into();
+                                        let sy: f32 = ev.position.y.into();
+                                        let local_x = (sx - ox).max(0.0);
+                                        let local_y = (sy - oy).max(0.0);
+                                        this.state.pointer_down(
+                                            local_x,
+                                            local_y,
+                                            ev.modifiers.shift,
+                                            ev.click_count,
+                                        );
                                         cx.notify();
-                                    }
-                                    return;
-                                };
-                                let canvas_pt =
-                                    this.state.viewport.screen_to_canvas(local_x, local_y);
-
-                                match drag {
-                                    CanvasDragOp::Pan { last_screen } => {
-                                        this.state.viewport.pan_by(
-                                            local_x - last_screen.0,
-                                            local_y - last_screen.1,
-                                        );
-                                        this.state.active_drag = Some(CanvasDragOp::Pan {
-                                            last_screen: (local_x, local_y),
-                                        });
-                                    }
-                                    CanvasDragOp::CreateObject { obj_idx } => {
-                                        if matches!(
-                                            this.state.active_tool,
-                                            ToolMode::Pen | ToolMode::Highlighter
-                                        ) {
-                                            this.state.gizmos_g1.append_stroke_point(
-                                                &mut this.state.session,
-                                                obj_idx,
-                                                canvas_pt,
-                                            );
-                                        } else if let Some(mut obj) = this
-                                            .state
-                                            .session
-                                            .page
-                                            .capture_objects
-                                            .get(obj_idx)
-                                            .cloned()
-                                        {
-                                            let sp =
-                                                obj.start_point.unwrap_or(PointF::new(0.0, 0.0));
-                                            // Preserve comfortable default size on simple clicks (< 8px) for Text, Callout, and Stamp
-                                            let min_drag_met = (canvas_pt.x - sp.x).abs() >= 12.0
-                                                || (canvas_pt.y - sp.y).abs() >= 12.0;
-                                            if !matches!(
-                                                obj.tool_mode,
-                                                Some(
-                                                    ToolMode::Text
-                                                        | ToolMode::Callout
-                                                        | ToolMode::Stamp
-                                                )
-                                            ) || min_drag_met
-                                            {
-                                                obj.end_point = Some(canvas_pt);
-                                                if obj.tool_mode == Some(ToolMode::Callout) {
-                                                    let r = RectF::from_points(sp, canvas_pt);
-                                                    obj.tail_points = Some(vec![PointF::new(
-                                                        r.x + r.width * 0.25,
-                                                        r.y + r.height + 28.0,
-                                                    )]);
-                                                }
-                                            }
-                                            if obj.tool_mode == Some(ToolMode::Arrow) {
-                                                obj.points_array = Some(vec![
-                                                    sp,
-                                                    PointF::new(
-                                                        (sp.x + canvas_pt.x) * 0.5,
-                                                        (sp.y + canvas_pt.y) * 0.5,
-                                                    ),
-                                                    canvas_pt,
-                                                ]);
-                                            }
-                                            this.state.session.update_object(obj_idx, obj);
+                                    }),
+                                )
+                                .on_mouse_move(cx.listener(
+                                    |this, ev: &MouseMoveEvent, _window, cx| {
+                                        let (ox, oy) = this.canvas_origin.get();
+                                        let sx: f32 = ev.position.x.into();
+                                        let sy: f32 = ev.position.y.into();
+                                        let local_x = (sx - ox).max(0.0);
+                                        let local_y = (sy - oy).max(0.0);
+                                        if this.state.pointer_move(local_x, local_y) {
+                                            cx.notify();
                                         }
-                                    }
-                                    CanvasDragOp::MoveObject { last_canvas } => {
-                                        let dx = canvas_pt.x - last_canvas.x;
-                                        let dy = canvas_pt.y - last_canvas.y;
-                                        this.state.gizmos_g1.nudge_selected(
-                                            &mut this.state.session,
-                                            dx,
-                                            dy,
-                                        );
-                                        this.state.active_drag = Some(CanvasDragOp::MoveObject {
-                                            last_canvas: canvas_pt,
-                                        });
-                                    }
-                                    CanvasDragOp::EraseStroke { mut points } => {
-                                        points.push(canvas_pt);
-                                        this.state.raster.apply_eraser_stroke(
-                                            &mut this.state.session,
-                                            &points,
-                                            ColorRgba::TRANSPARENT,
-                                        );
-                                        this.state.active_drag =
-                                            Some(CanvasDragOp::EraseStroke { points });
-                                    }
-                                    CanvasDragOp::RegionTool { start, .. } => {
-                                        this.state.active_drag = Some(CanvasDragOp::RegionTool {
-                                            start,
-                                            current: canvas_pt,
-                                        });
-                                    }
-                                    CanvasDragOp::EffectSpotlight {
-                                        effect_idx,
-                                        part,
-                                        start_canvas,
-                                        orig_rect,
-                                    } => {
-                                        let (bw, bh) = this
-                                            .state
-                                            .effects_gallery
-                                            .base_dimensions(&this.state.session);
-                                        let next_r = EffectsGalleryState::drag_spotlight_rect(
-                                            orig_rect,
-                                            part,
-                                            canvas_pt.x - start_canvas.x,
-                                            canvas_pt.y - start_canvas.y,
-                                            bw,
-                                            bh,
-                                        );
-                                        if let Some(EffectConfig::SpotlightAndMagnify {
-                                            dim_opacity,
-                                            blur_radius,
-                                            magnify_scale,
-                                            ..
-                                        }) = this
-                                            .state
-                                            .effects_gallery
-                                            .entries
-                                            .get(effect_idx)
-                                            .map(|e| e.config.clone())
-                                        {
-                                            this.state.effects_gallery.update_effect_config(
-                                                &mut this.state.session,
-                                                effect_idx,
-                                                EffectConfig::SpotlightAndMagnify {
-                                                    x: next_r.x,
-                                                    y: next_r.y,
-                                                    width: next_r.width,
-                                                    height: next_r.height,
-                                                    dim_opacity,
-                                                    blur_radius,
-                                                    magnify_scale,
-                                                },
-                                                false,
-                                            );
-                                            this.state.status_message = format!(
-                                                "Spotlight: ({:.0}, {:.0}) · {:.0}×{:.0} px",
-                                                next_r.x, next_r.y, next_r.width, next_r.height
-                                            );
-                                        }
-                                    }
-                                }
-                                cx.notify();
-                            }))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|this, _ev: &MouseUpEvent, _window, cx| {
-                                    if let Some(CanvasDragOp::RegionTool { start, current }) =
-                                        this.state.active_drag.take()
-                                    {
-                                        let cw_max = this.state.session.bitmap.width().max(1) as f64;
-                                        let ch_max =
-                                            this.state.session.bitmap.height().max(1) as f64;
-                                        let x = start.x.min(current.x).clamp(0.0, cw_max - 1.0);
-                                        let y = start.y.min(current.y).clamp(0.0, ch_max - 1.0);
-                                        let x1 =
-                                            start.x.max(current.x).clamp(x + 1.0, cw_max);
-                                        let y1 =
-                                            start.y.max(current.y).clamp(y + 1.0, ch_max);
-                                        let w = x1 - x;
-                                        let h = y1 - y;
-                                        if w >= 4.0 && h >= 4.0 {
-                                            let rect = RectF::new(x, y, w, h);
-                                            match this.state.active_tool {
-                                                ToolMode::Blur => {
-                                                    this.state.raster.place_blur_region(
-                                                        &mut this.state.session,
-                                                        rect,
-                                                    );
-                                                    this.state.status_message = format!(
-                                                        "Blurred {:.0}×{:.0} px region",
-                                                        w, h
-                                                    );
-                                                }
-                                                ToolMode::Magnify => {
-                                                    this.state.raster.place_magnify_region(
-                                                        &mut this.state.session,
-                                                        rect,
-                                                    );
-                                                    this.state.status_message = format!(
-                                                        "Magnified {:.0}×{:.0} px region",
-                                                        w, h
-                                                    );
-                                                }
-                                                ToolMode::Crop => {
-                                                    // Snagit workflow: stage pending Crop box & wait for ✓ Crop button or Enter!
-                                                    this.state.pending_crop_rect = Some(rect);
-                                                    this.state.status_message = format!(
-                                                        "Crop {:.0}×{:.0} px ready — click ✓ Crop or press Enter",
-                                                        w, h
-                                                    );
-                                                }
-                                                ToolMode::CutOut => {
-                                                    if w >= h {
-                                                        this.state.raster.cutout.orientation =
-                                                            CutOutOrientation::Horizontal;
-                                                        this.state.raster.cutout.start =
-                                                            y.round().max(0.0) as u32;
-                                                        this.state.raster.cutout.end =
-                                                            (y + h).round().max(1.0) as u32;
-                                                    } else {
-                                                        this.state.raster.cutout.orientation =
-                                                            CutOutOrientation::Vertical;
-                                                        this.state.raster.cutout.start =
-                                                            x.round().max(0.0) as u32;
-                                                        this.state.raster.cutout.end =
-                                                            (x + w).round().max(1.0) as u32;
-                                                    }
-                                                    if this
-                                                        .state
-                                                        .raster
-                                                        .apply_cut_out(&mut this.state.session)
-                                                    {
-                                                        this.state.status_message =
-                                                            "Applied Cut Out strip".to_string();
-                                                    }
-                                                }
-                                                ToolMode::Selection => {
-                                                    this.state.active_selection_rect = Some(rect);
-                                                    this.state.raster.selection_points = vec![
-                                                        PointF::new(x, y),
-                                                        PointF::new(x + w, y + h),
-                                                    ];
-                                                    this.state.status_message = format!(
-                                                        "Selected {:.0}×{:.0} px (Del to clear, Ctrl+C to copy)",
-                                                        w, h
-                                                    );
-                                                }
-                                                ToolMode::Simplify => {
-                                                    let fill_col = this
-                                                        .state
-                                                        .simplify_ui
-                                                        .palette
-                                                        .palette_colors
-                                                        .first()
-                                                        .copied()
-                                                        .unwrap_or_else(|| this.state.active_color_rgba());
-                                                    let obj = CaptureObject {
-                                                        tool_mode: Some(ToolMode::Simplify),
-                                                        start_point: Some(PointF::new(x, y)),
-                                                        end_point: Some(PointF::new(x + w, y + h)),
-                                                        background_color: Some(fill_col),
-                                                        foreground_color: Some(ColorRgba::TRANSPARENT),
-                                                        stroke_width: Some(0.0),
-                                                        corner_radius_ratio: Some(0.12),
-                                                        opacity: Some(100.0),
-                                                        ..CaptureObject::default()
-                                                    };
-                                                    let idx = this.state.session.add_object(obj);
-                                                    this.state.gizmos_g1.selected_indices = vec![idx];
-                                                    this.state.status_message = format!(
-                                                        "Placed {:.0}×{:.0} px Simplify block (Ctrl+Z to undo)",
-                                                        w, h
-                                                    );
-                                                }
-                                                _ => {}
-                                            }
-                                        } else if this.state.active_tool == ToolMode::Selection {
-                                            if this.state.active_selection_rect.take().is_some() {
-                                                this.state.raster.selection_points.clear();
-                                                this.state.status_message =
-                                                    "Selection cleared".to_string();
-                                            }
-                                        }
-                                    }
-                                    this.state.viewport.active_guides.clear();
-                                    cx.notify();
-                                }),
-                            )
+                                    },
+                                ))
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _ev: &MouseUpEvent, _window, cx| {
+                                        this.state.pointer_up();
+                                        cx.notify();
+                                    }),
+                                )
                             .on_scroll(cx.listener(
                                 |this, ev: &ScrollEvent, _window, cx| {
                                     let delta_px = match ev.delta {
@@ -7031,5 +7184,153 @@ mod tests {
         assert!(st.recent_captures[1].thumbnail.is_some());
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn single_history_entry_per_tool_gesture_and_step_counter_sync() {
+        let mut st = EditorShellState::default();
+        st.create_new_blank_canvas(600, 400);
+        st.viewport.zoom = 1.0;
+        st.viewport.pan_x = 0.0;
+        st.viewport.pan_y = 0.0;
+        st.viewport.device_scale = 1.0;
+        assert_eq!(st.session.history.undo_len(), 0);
+
+        // 1. Step tool: mouse_down + 20 mouse_move frames + mouse_up MUST record EXACTLY 1 history step!
+        st.select_tool(ToolMode::Step);
+        st.pointer_down(100.0, 100.0, false, 1);
+        for i in 1..=20 {
+            st.pointer_move(100.0 + (i as f32) * 0.4, 100.0 + (i as f32) * 0.3); // slight click jitter (< 12px)
+        }
+        st.pointer_up();
+        assert_eq!(st.session.history.undo_len(), 1, "1 Step placement must be 1 history step");
+        assert_eq!(st.session.page.capture_objects.len(), 1);
+        assert_eq!(st.session.page.capture_objects[0].step_value.as_deref(), Some("1"));
+        assert_eq!(st.gizmos_g1.step_counter.next_index, 2);
+
+        // Place Step "2" with an intentional drag resize (25 mouse_move frames)
+        st.pointer_down(220.0, 120.0, false, 1);
+        for i in 1..=25 {
+            st.pointer_move(220.0 + i as f32, 120.0);
+        }
+        st.pointer_up();
+        assert_eq!(st.session.history.undo_len(), 2, "2nd Step drag must add only 1 history step");
+        assert_eq!(st.session.page.capture_objects[1].step_value.as_deref(), Some("2"));
+        assert_eq!(st.gizmos_g1.step_counter.next_index, 3);
+
+        // Undo Step "2" -> single Ctrl+Z removes Step "2" AND rewinds Step counter back to 2!
+        assert!(st.perform_undo());
+        assert_eq!(st.session.history.undo_len(), 1);
+        assert_eq!(st.session.page.capture_objects.len(), 1);
+        assert_eq!(st.gizmos_g1.step_counter.next_index, 2);
+
+        // Redo Step "2" -> restores Step "2" AND advances Step counter back to 3!
+        assert!(st.perform_redo());
+        assert_eq!(st.session.history.undo_len(), 2);
+        assert_eq!(st.session.page.capture_objects.len(), 2);
+        assert_eq!(st.gizmos_g1.step_counter.next_index, 3);
+
+        // 2. Shape, Arrow, and Pen freehand strokes: 20+ mouse_move frames each -> 1 history step each!
+        st.select_tool(ToolMode::Shape);
+        st.selected_shape_kind = "RoundedRectangle".to_string();
+        st.shape_dashed = true;
+        st.pointer_down(40.0, 200.0, false, 1);
+        for i in 1..=20 {
+            st.pointer_move(40.0 + (i as f32) * 4.0, 200.0 + (i as f32) * 3.0);
+        }
+        st.pointer_up();
+        assert_eq!(st.session.history.undo_len(), 3, "Shape drag must be 1 history step");
+
+        st.select_tool(ToolMode::Arrow);
+        st.pointer_down(300.0, 200.0, false, 1);
+        for i in 1..=20 {
+            st.pointer_move(300.0 + (i as f32) * 5.0, 200.0 + (i as f32) * 2.0);
+        }
+        st.pointer_up();
+        assert_eq!(st.session.history.undo_len(), 4, "Arrow drag must be 1 history step");
+
+        st.select_tool(ToolMode::Pen);
+        st.pointer_down(50.0, 300.0, false, 1);
+        for i in 1..=30 {
+            st.pointer_move(50.0 + (i as f32) * 3.0, 300.0 + ((i % 5) as f32));
+        }
+        st.pointer_up();
+        assert_eq!(st.session.history.undo_len(), 5, "30-point Pen stroke must be 1 history step");
+
+        // 3. Move tool: click without moving -> 0 history steps; 15-frame drag -> 1 history step!
+        st.select_tool(ToolMode::Move);
+        st.pointer_down(100.0, 100.0, false, 1); // select Step "1"
+        st.pointer_up();
+        assert_eq!(st.session.history.undo_len(), 5, "Click-to-select without drag must add 0 steps");
+
+        st.pointer_down(100.0, 100.0, false, 1);
+        for i in 1..=15 {
+            st.pointer_move(100.0 + (i as f32) * 2.0, 100.0 + (i as f32) * 2.0);
+        }
+        st.pointer_up();
+        assert_eq!(st.session.history.undo_len(), 6, "Dragging object across 15 frames must add 1 step");
+
+        // 4. Text tool: place new Text + type 10 keystrokes + finish -> 1 single AddObject step!
+        st.select_tool(ToolMode::Text);
+        st.pointer_down(350.0, 40.0, false, 1);
+        st.pointer_up();
+        assert_eq!(st.session.history.undo_len(), 7);
+        for ch in "Hello Step".chars() {
+            let mut buf = [0u8; 4];
+            st.inline_text.insert_text(ch.encode_utf8(&mut buf));
+            st.sync_active_text_to_session();
+        }
+        st.finish_text_editing();
+        assert_eq!(st.session.history.undo_len(), 7, "Typing into new Text box must coalesce into 1 step");
+
+        // Re-edit existing Text box + type 3 chars + finish -> 1 single UpdateObject step!
+        let txt_idx = st.session.page.capture_objects.len() - 1;
+        st.start_editing_text_object(txt_idx);
+        for ch in " 1!".chars() {
+            let mut buf = [0u8; 4];
+            st.inline_text.insert_text(ch.encode_utf8(&mut buf));
+            st.sync_active_text_to_session();
+        }
+        st.finish_text_editing();
+        assert_eq!(st.session.history.undo_len(), 8, "Re-editing existing Text box must add 1 step");
+
+        // 5. Eraser multi-point stroke -> 1 RasterSnapshot step
+        st.select_tool(ToolMode::Eraser);
+        st.pointer_down(10.0, 10.0, false, 1);
+        for i in 1..=15 {
+            st.pointer_move(10.0 + (i as f32) * 3.0, 10.0);
+        }
+        st.pointer_up();
+        assert_eq!(st.session.history.undo_len(), 9, "Eraser stroke must add 1 step");
+
+        // 6. Auto-Simplify + Show Original + Clear -> 1 step for ON, 0 for Show Original, 1 for OFF
+        st.session.bitmap.mutate_region(PixelRect::new(420, 260, 120, 44), |_, _, px| {
+            *px = [37, 99, 235, 255];
+        });
+        let simp_n = st.simplify_ui.run_auto_simplify(&mut st.session);
+        assert!(simp_n >= 1);
+        assert_eq!(st.session.history.undo_len(), 10, "Auto-Simplify generating N shapes must add 1 step");
+        st.simplify_ui.set_show_original(true, &mut st.session);
+        st.simplify_ui.set_show_original(false, &mut st.session);
+        assert_eq!(st.session.history.undo_len(), 10, "Show Original preview must add 0 history steps");
+        st.simplify_ui.clear_auto_simplify(&mut st.session);
+        assert_eq!(st.session.history.undo_len(), 11, "Clearing Auto-Simplify must add 1 step");
+
+        // 7. Smart Move one-gesture lift + drag -> 1 atomic Batch step!
+        st.select_tool(ToolMode::Move);
+        let det_n = st.smart_move.scan(&st.session);
+        assert!(det_n >= 1);
+        st.pointer_down(450.0, 280.0, false, 1);
+        for i in 1..=12 {
+            st.pointer_move(450.0 + (i as f32) * 4.0, 280.0 + (i as f32) * 2.0);
+        }
+        st.pointer_up();
+        assert_eq!(st.session.history.undo_len(), 12, "Smart Move lift + drag must be 1 atomic step");
+
+        // Single Undo of Smart Move restores original blue button pixel AND removes lifted Image object!
+        let objs_before_undo = st.session.page.capture_objects.len();
+        assert!(st.perform_undo());
+        assert_eq!(st.session.page.capture_objects.len(), objs_before_undo - 1);
+        assert_eq!(st.session.bitmap.get_pixel(450, 280), Some([37, 99, 235, 255]));
     }
 }

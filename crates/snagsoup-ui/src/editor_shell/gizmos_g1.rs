@@ -6,7 +6,7 @@
 //! - Direct creation & editing for Arrow, Line, Shape, Step (auto-incrementing `1,2,3`/`A,B,C`),
 //!   Pen, and Highlighter
 
-use snagsoup_canvas::{DocumentSession, SceneCompositor, TiledBitmap, hit_test_object};
+use snagsoup_canvas::{DocumentSession, HistoryCommand, SceneCompositor, TiledBitmap, hit_test_object};
 use snagsoup_model::{CaptureObject, ColorRgba, PointF, RectF, ToolMode};
 
 /// Step badge numbering sequence style.
@@ -49,6 +49,39 @@ impl StepCounter {
                 c.to_string()
             }
         }
+    }
+
+    /// Re-synchronize `next_index` with existing `ToolMode::Step` objects on the canvas
+    /// so Undo/Redo/Delete keeps automatic numbering (`1, 2, 3...` / `A, B, C...`) contiguous.
+    pub fn sync_with_objects(&mut self, objects: &[CaptureObject]) {
+        let mut max_idx = 0u32;
+        for obj in objects {
+            if obj.tool_mode != Some(ToolMode::Step) {
+                continue;
+            }
+            let Some(val) = obj.step_value.as_deref() else {
+                continue;
+            };
+            let parsed = match self.sequence {
+                StepSequence::Numeric => val.trim().parse::<u32>().ok(),
+                StepSequence::UpperAlpha => val
+                    .trim()
+                    .bytes()
+                    .next()
+                    .filter(|b| b.is_ascii_uppercase())
+                    .map(|b| (b - b'A') as u32 + 1),
+                StepSequence::LowerAlpha => val
+                    .trim()
+                    .bytes()
+                    .next()
+                    .filter(|b| b.is_ascii_lowercase())
+                    .map(|b| (b - b'a') as u32 + 1),
+            };
+            if let Some(n) = parsed {
+                max_idx = max_idx.max(n);
+            }
+        }
+        self.next_index = max_idx + 1;
     }
 }
 
@@ -128,10 +161,9 @@ impl GizmoControllerG1 {
         }
     }
 
-    /// Create a new Group 1 vector object (Arrow, Line, Shape, Step, Pen, Highlighter).
-    pub fn create_object(
+    /// Construct a new Group 1 vector [`CaptureObject`] without mutating `DocumentSession`.
+    pub fn build_new_object(
         &mut self,
-        session: &mut DocumentSession,
         tool: ToolMode,
         start: PointF,
         end: PointF,
@@ -139,7 +171,7 @@ impl GizmoControllerG1 {
         fill_color: ColorRgba,
         stroke_width: f64,
         opacity: f64,
-    ) -> usize {
+    ) -> CaptureObject {
         let mut obj = CaptureObject {
             object_id: Some(self.alloc_id(tool.as_str())),
             tool_mode: Some(tool.clone()),
@@ -172,10 +204,59 @@ impl GizmoControllerG1 {
             }
             _ => {}
         }
+        obj
+    }
 
+    /// Create a new Group 1 vector object onto `session` without recording history yet
+    /// (used at `mouse_down` so `mouse_up` records a single `AddObject` command).
+    pub fn create_object_unrecorded(
+        &mut self,
+        session: &mut DocumentSession,
+        tool: ToolMode,
+        start: PointF,
+        end: PointF,
+        stroke_color: ColorRgba,
+        fill_color: ColorRgba,
+        stroke_width: f64,
+        opacity: f64,
+    ) -> usize {
+        let obj = self.build_new_object(tool, start, end, stroke_color, fill_color, stroke_width, opacity);
+        let idx = session.add_object_unrecorded(obj);
+        self.selected_indices = vec![idx];
+        idx
+    }
+
+    /// Create a new Group 1 vector object (Arrow, Line, Shape, Step, Pen, Highlighter).
+    pub fn create_object(
+        &mut self,
+        session: &mut DocumentSession,
+        tool: ToolMode,
+        start: PointF,
+        end: PointF,
+        stroke_color: ColorRgba,
+        fill_color: ColorRgba,
+        stroke_width: f64,
+        opacity: f64,
+    ) -> usize {
+        let obj = self.build_new_object(tool, start, end, stroke_color, fill_color, stroke_width, opacity);
         let idx = session.add_object(obj);
         self.selected_indices = vec![idx];
         idx
+    }
+
+    /// Append a freehand stroke point during an active mouse drag **without** pushing intermediate history.
+    pub fn append_stroke_point_unrecorded(&self, session: &mut DocumentSession, idx: usize, pt: PointF) {
+        if let Some(mut obj) = session.page.capture_objects.get(idx).cloned() {
+            let pts = obj.points_array.get_or_insert_with(Vec::new);
+            let moved_enough = pts
+                .last()
+                .map_or(true, |prev| (pt.x - prev.x).hypot(pt.y - prev.y) >= 0.5);
+            if moved_enough {
+                pts.push(pt);
+            }
+            obj.end_point = Some(pt);
+            session.set_object_unrecorded(idx, obj);
+        }
     }
 
     /// Append a freehand stroke point to an active Pen / Highlighter object.
@@ -252,25 +333,47 @@ impl GizmoControllerG1 {
         session.update_object(idx, obj)
     }
 
-    /// Nudge all selected objects by `(dx, dy)` pixels (`1px` or `Shift+Arrow` `10px`).
-    pub fn nudge_selected(&self, session: &mut DocumentSession, dx: f64, dy: f64) {
+    /// Translate all selected objects in place during an active mouse drag without recording history.
+    pub fn translate_selected_unrecorded(&self, session: &mut DocumentSession, dx: f64, dy: f64) {
+        if dx == 0.0 && dy == 0.0 {
+            return;
+        }
         for &idx in &self.selected_indices {
             if let Some(mut obj) = session.page.capture_objects.get(idx).cloned() {
                 translate_object(&mut obj, dx, dy);
-                session.update_object(idx, obj);
+                session.set_object_unrecorded(idx, obj);
             }
         }
     }
 
-    /// Delete all selected objects (`Delete` / `Backspace`).
+    /// Nudge all selected objects by `(dx, dy)` pixels (`1px` or `Shift+Arrow` `10px`) as one Undo step.
+    pub fn nudge_selected(&self, session: &mut DocumentSession, dx: f64, dy: f64) {
+        if dx == 0.0 && dy == 0.0 || self.selected_indices.is_empty() {
+            return;
+        }
+        let indices = self.selected_indices.clone();
+        session.execute_batch(|session| {
+            for idx in indices {
+                if let Some(mut obj) = session.page.capture_objects.get(idx).cloned() {
+                    translate_object(&mut obj, dx, dy);
+                    session.update_object(idx, obj);
+                }
+            }
+        });
+    }
+
+    /// Delete all selected objects (`Delete` / `Backspace`) as one Undo step.
     pub fn delete_selected(&mut self, session: &mut DocumentSession) {
         let mut sorted = self.selected_indices.clone();
         sorted.sort_unstable();
         sorted.dedup();
-        for idx in sorted.into_iter().rev() {
-            session.delete_object(idx);
-        }
+        session.execute_batch(|session| {
+            for idx in sorted.into_iter().rev() {
+                session.delete_object(idx);
+            }
+        });
         self.selected_indices.clear();
+        self.step_counter.sync_with_objects(&session.page.capture_objects);
     }
 
     /// Copy selected objects (`Ctrl+C`).
@@ -282,15 +385,21 @@ impl GizmoControllerG1 {
             .collect();
     }
 
-    /// Paste copied objects with a +16px offset (`Ctrl+V`).
+    /// Paste copied objects with a +16px offset (`Ctrl+V`) as one Undo step.
     pub fn paste(&mut self, session: &mut DocumentSession) {
         let mut new_sel = Vec::new();
         let clones = self.clipboard_objects.clone();
+        let mut prepared = Vec::with_capacity(clones.len());
         for mut obj in clones {
             obj.object_id = Some(self.alloc_id("paste"));
             translate_object(&mut obj, 16.0, 16.0);
-            new_sel.push(session.add_object(obj));
+            prepared.push(obj);
         }
+        session.execute_batch(|session| {
+            for obj in prepared {
+                new_sel.push(session.add_object(obj));
+            }
+        });
         if !new_sel.is_empty() {
             self.selected_indices = new_sel;
         }
@@ -329,7 +438,7 @@ impl GizmoControllerG1 {
         }
     }
 
-    /// Flatten all vector objects permanently into the raster `TiledBitmap` (Undoable).
+    /// Flatten all vector objects permanently into the raster `TiledBitmap` (single Undoable step).
     pub fn flatten_all(&mut self, session: &mut DocumentSession) -> bool {
         let comp = SceneCompositor::new(&session.page, Some(&session.bitmap));
         let Ok((w, h, rgba)) = comp.flatten_to_rgba() else {
@@ -338,9 +447,19 @@ impl GizmoControllerG1 {
         let Ok(flat_bmp) = TiledBitmap::from_rgba(w, h, &rgba) else {
             return false;
         };
-        session.bitmap = flat_bmp;
+        let before_bitmap = session.bitmap.clone();
+        let before_objects = session.page.capture_objects.clone();
+        session.bitmap = flat_bmp.clone();
         session.page.capture_objects.clear();
+        session.history.push(HistoryCommand::CanvasResize {
+            before_bitmap,
+            after_bitmap: flat_bmp,
+            before_objects,
+            after_objects: Vec::new(),
+        });
+        session.dirty.mark_all(w, h);
         self.selected_indices.clear();
+        self.step_counter.sync_with_objects(&session.page.capture_objects);
         true
     }
 }

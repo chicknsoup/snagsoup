@@ -81,14 +81,41 @@ pub enum HistoryCommand {
         before_objects: Vec<CaptureObject>,
         after_objects: Vec<CaptureObject>,
     },
+    /// Atomic compound user gesture grouping multiple sub-commands into a single Undo/Redo step.
+    Batch(Vec<HistoryCommand>),
 }
 
-/// Bounded Undo/Redo stack (default 50 steps) with CoW tile memory accounting.
+fn collect_cmd_tile_ptrs(cmd: &HistoryCommand, ptrs: &mut HashSet<usize>) {
+    match cmd {
+        HistoryCommand::RasterSnapshot { before, after, .. } => {
+            before.collect_unique_tile_ptrs(ptrs);
+            after.collect_unique_tile_ptrs(ptrs);
+        }
+        HistoryCommand::CanvasResize {
+            before_bitmap,
+            after_bitmap,
+            ..
+        } => {
+            before_bitmap.collect_unique_tile_ptrs(ptrs);
+            after_bitmap.collect_unique_tile_ptrs(ptrs);
+        }
+        HistoryCommand::Batch(cmds) => {
+            for sub in cmds {
+                collect_cmd_tile_ptrs(sub, ptrs);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Bounded Undo/Redo stack (default 50 steps) with CoW tile memory accounting and batch grouping.
 #[derive(Debug, Clone)]
 pub struct CommandHistory {
     max_steps: usize,
     undo_stack: VecDeque<HistoryCommand>,
     redo_stack: Vec<HistoryCommand>,
+    batch_depth: usize,
+    pending_batch: Vec<HistoryCommand>,
 }
 
 impl Default for CommandHistory {
@@ -103,6 +130,8 @@ impl CommandHistory {
             max_steps: max_steps.max(1),
             undo_stack: VecDeque::new(),
             redo_stack: Vec::new(),
+            batch_depth: 0,
+            pending_batch: Vec::new(),
         }
     }
 
@@ -128,15 +157,37 @@ impl CommandHistory {
 
     pub fn push(&mut self, cmd: HistoryCommand) {
         self.redo_stack.clear();
+        if self.batch_depth > 0 {
+            self.pending_batch.push(cmd);
+            return;
+        }
         if self.undo_stack.len() >= self.max_steps {
             self.undo_stack.pop_front();
         }
         self.undo_stack.push_back(cmd);
     }
 
+    /// If the most recent undo command is `AddObject` at `index`, updates its stored `object`
+    /// in place (used to merge immediate inline text typing into a newly placed `Text`/`Callout`).
+    pub fn update_top_added_object(&mut self, index: usize, updated: CaptureObject) -> bool {
+        if let Some(HistoryCommand::AddObject {
+            index: top_idx,
+            object,
+        }) = self.undo_stack.back_mut()
+        {
+            if *top_idx == index {
+                *object = updated;
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn clear(&mut self) {
         self.undo_stack.clear();
         self.redo_stack.clear();
+        self.batch_depth = 0;
+        self.pending_batch.clear();
     }
 
     /// Computes total unique tile bytes across `current` plus all raster snapshots in history.
@@ -144,21 +195,7 @@ impl CommandHistory {
         let mut ptrs = HashSet::new();
         current.collect_unique_tile_ptrs(&mut ptrs);
         for cmd in self.undo_stack.iter().chain(self.redo_stack.iter()) {
-            match cmd {
-                HistoryCommand::RasterSnapshot { before, after, .. } => {
-                    before.collect_unique_tile_ptrs(&mut ptrs);
-                    after.collect_unique_tile_ptrs(&mut ptrs);
-                }
-                HistoryCommand::CanvasResize {
-                    before_bitmap,
-                    after_bitmap,
-                    ..
-                } => {
-                    before_bitmap.collect_unique_tile_ptrs(&mut ptrs);
-                    after_bitmap.collect_unique_tile_ptrs(&mut ptrs);
-                }
-                _ => {}
-            }
+            collect_cmd_tile_ptrs(cmd, &mut ptrs);
         }
         ptrs.len() * TILE_BYTES
     }
@@ -171,21 +208,7 @@ impl CommandHistory {
         let mut all_ptrs = HashSet::new();
         current.collect_unique_tile_ptrs(&mut all_ptrs);
         for cmd in self.undo_stack.iter().chain(self.redo_stack.iter()) {
-            match cmd {
-                HistoryCommand::RasterSnapshot { before, after, .. } => {
-                    before.collect_unique_tile_ptrs(&mut all_ptrs);
-                    after.collect_unique_tile_ptrs(&mut all_ptrs);
-                }
-                HistoryCommand::CanvasResize {
-                    before_bitmap,
-                    after_bitmap,
-                    ..
-                } => {
-                    before_bitmap.collect_unique_tile_ptrs(&mut all_ptrs);
-                    after_bitmap.collect_unique_tile_ptrs(&mut all_ptrs);
-                }
-                _ => {}
-            }
+            collect_cmd_tile_ptrs(cmd, &mut all_ptrs);
         }
 
         let extra_tiles = all_ptrs.difference(&base_ptrs).count();
@@ -225,6 +248,69 @@ impl DocumentSession {
         self.history.push(HistoryCommand::AddObject { index, object });
         self.dirty.mark_all(self.bitmap.width(), self.bitmap.height());
         index
+    }
+
+    /// Inserts `object` onto the canvas and marks dirty for live rendering **without** recording
+    /// a history entry yet (paired with a single `HistoryCommand::AddObject` on gesture completion).
+    pub fn add_object_unrecorded(&mut self, object: CaptureObject) -> usize {
+        let index = self.page.capture_objects.len();
+        self.page.capture_objects.push(object);
+        self.dirty.mark_all(self.bitmap.width(), self.bitmap.height());
+        index
+    }
+
+    /// Updates `page.capture_objects[index]` in place for smooth live drag/typing preview
+    /// **without** pushing intermediate `UpdateObject` steps into Undo history.
+    pub fn set_object_unrecorded(&mut self, index: usize, object: CaptureObject) -> bool {
+        let Some(slot) = self.page.capture_objects.get_mut(index) else {
+            return false;
+        };
+        *slot = object;
+        self.dirty.mark_all(self.bitmap.width(), self.bitmap.height());
+        true
+    }
+
+    /// Removes `page.capture_objects[index]` without pushing a history command.
+    pub fn delete_object_unrecorded(&mut self, index: usize) -> Option<CaptureObject> {
+        if index >= self.page.capture_objects.len() {
+            return None;
+        }
+        let obj = self.page.capture_objects.remove(index);
+        self.dirty.mark_all(self.bitmap.width(), self.bitmap.height());
+        Some(obj)
+    }
+
+    /// Begins a compound history batch (supports nesting; committed as one Undo step on `end_batch`).
+    pub fn begin_batch(&mut self) {
+        self.history.batch_depth += 1;
+    }
+
+    /// Commits the active compound history batch into a single Undo entry (if outermost).
+    pub fn end_batch(&mut self) {
+        if self.history.batch_depth == 0 {
+            return;
+        }
+        self.history.batch_depth -= 1;
+        if self.history.batch_depth == 0 && !self.history.pending_batch.is_empty() {
+            let mut cmds = std::mem::take(&mut self.history.pending_batch);
+            let grouped = if cmds.len() == 1 {
+                cmds.pop().expect("len == 1")
+            } else {
+                HistoryCommand::Batch(cmds)
+            };
+            self.history.push(grouped);
+        }
+    }
+
+    /// Executes `f(self)` while grouping all history commands pushed inside `f` into **one** atomic Undo/Redo step.
+    pub fn execute_batch<F, R>(&mut self, f: F) -> R
+    where
+        F: FnOnce(&mut Self) -> R,
+    {
+        self.begin_batch();
+        let out = f(self);
+        self.end_batch();
+        out
     }
 
     pub fn update_object(&mut self, index: usize, after: CaptureObject) -> bool {
@@ -287,11 +373,8 @@ impl DocumentSession {
         modified
     }
 
-    pub fn undo(&mut self) -> bool {
-        let Some(cmd) = self.history.undo_stack.pop_back() else {
-            return false;
-        };
-        match &cmd {
+    fn apply_undo_cmd(&mut self, cmd: &HistoryCommand) {
+        match cmd {
             HistoryCommand::AddObject { index, .. } => {
                 if *index < self.page.capture_objects.len() {
                     self.page.capture_objects.remove(*index);
@@ -328,20 +411,22 @@ impl DocumentSession {
                 before_objects,
                 ..
             } => {
+                self.page.capture_canvas_width = Some(before_bitmap.width() as f64);
+                self.page.capture_canvas_height = Some(before_bitmap.height() as f64);
                 self.bitmap = before_bitmap.clone();
                 self.page.capture_objects = before_objects.clone();
                 self.dirty.mark_all(self.bitmap.width(), self.bitmap.height());
             }
+            HistoryCommand::Batch(cmds) => {
+                for sub in cmds.iter().rev() {
+                    self.apply_undo_cmd(sub);
+                }
+            }
         }
-        self.history.redo_stack.push(cmd);
-        true
     }
 
-    pub fn redo(&mut self) -> bool {
-        let Some(cmd) = self.history.redo_stack.pop() else {
-            return false;
-        };
-        match &cmd {
+    fn apply_redo_cmd(&mut self, cmd: &HistoryCommand) {
+        match cmd {
             HistoryCommand::AddObject { index, object } => {
                 let idx = (*index).min(self.page.capture_objects.len());
                 self.page.capture_objects.insert(idx, object.clone());
@@ -378,11 +463,34 @@ impl DocumentSession {
                 after_objects,
                 ..
             } => {
+                self.page.capture_canvas_width = Some(after_bitmap.width() as f64);
+                self.page.capture_canvas_height = Some(after_bitmap.height() as f64);
                 self.bitmap = after_bitmap.clone();
                 self.page.capture_objects = after_objects.clone();
                 self.dirty.mark_all(self.bitmap.width(), self.bitmap.height());
             }
+            HistoryCommand::Batch(cmds) => {
+                for sub in cmds {
+                    self.apply_redo_cmd(sub);
+                }
+            }
         }
+    }
+
+    pub fn undo(&mut self) -> bool {
+        let Some(cmd) = self.history.undo_stack.pop_back() else {
+            return false;
+        };
+        self.apply_undo_cmd(&cmd);
+        self.history.redo_stack.push(cmd);
+        true
+    }
+
+    pub fn redo(&mut self) -> bool {
+        let Some(cmd) = self.history.redo_stack.pop() else {
+            return false;
+        };
+        self.apply_redo_cmd(&cmd);
         self.history.undo_stack.push_back(cmd);
         true
     }

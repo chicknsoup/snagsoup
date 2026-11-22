@@ -8,11 +8,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::RenderImage;
-use snagsoup_canvas::{DocumentSession, PixelRect, SceneCompositor};
+use snagsoup_canvas::{DocumentSession, PixelRect, SceneCompositor, TiledBitmap};
 use snagsoup_cv_ocr::{
     MagicWandMode, SelectionMask, SmartElement, auto_simplify, detect_smart_objects,
     edit_text_in_session, extract_boundary_polylines, grab_text, lift_smart_object,
-    magic_wand_select, recognize_rgba,
+    lift_smart_object_unrecorded, magic_wand_select, recognize_rgba,
 };
 use snagsoup_model::{ColorRgba, PointF, RectF, SnagPalette};
 
@@ -61,6 +61,23 @@ impl SmartMoveUiState {
             })
             .min_by_key(|(_, el)| (el.bounds.width as u64) * (el.bounds.height as u64))
             .map(|(i, _)| i)
+    }
+
+    /// Lift a detected Smart Element by index without pushing history yet (used by interactive
+    /// mouse-down -> drag -> mouse-up so the entire lift + move commits as **one** Undo step).
+    pub fn lift_detected_index_unrecorded(
+        &mut self,
+        session: &mut DocumentSession,
+        det_idx: usize,
+    ) -> Result<(usize, TiledBitmap, PixelRect), String> {
+        let Some(elem) = self.detected.get(det_idx).cloned() else {
+            return Err("Smart Move element index out of range".into());
+        };
+        let (obj_idx, before_bmp, clipped, _tier) = lift_smart_object_unrecorded(session, elem.bounds)
+            .map_err(|e| format!("Smart Move lift failed: {e}"))?;
+        self.detected.remove(det_idx);
+        self.hovered_idx = None;
+        Ok((obj_idx, before_bmp, clipped))
     }
 
     /// Lift a detected Smart Element by index into a movable `ToolMode::Image` object,
@@ -178,8 +195,8 @@ impl SimplifyUiFloatyState {
         }
     }
 
-    /// Remove all previously auto-generated Simplify blocks (without touching user annotations or
-    /// manually drawn Simplify blocks).
+    /// Remove all previously auto-generated Simplify blocks as **one** atomic Undo step
+    /// (without touching user annotations or manually drawn Simplify blocks).
     pub fn clear_auto_simplify(&mut self, session: &mut DocumentSession) -> usize {
         let to_remove: Vec<usize> = session
             .page
@@ -193,9 +210,11 @@ impl SimplifyUiFloatyState {
             })
             .map(|(i, _)| i)
             .collect();
-        for &idx in to_remove.iter().rev() {
-            let _ = session.delete_object(idx);
-        }
+        session.execute_batch(|session| {
+            for &idx in to_remove.iter().rev() {
+                let _ = session.delete_object(idx);
+            }
+        });
         self.generated_indices.clear();
         self.enabled = false;
         self.show_original = false;
@@ -203,22 +222,25 @@ impl SimplifyUiFloatyState {
     }
 
     /// Run `auto_simplify` with current `detail` (`1..=10`) & `palette`, cleanly replacing any
-    /// previous auto-generated Simplify blocks instead of stacking duplicates.
+    /// previous auto-generated Simplify blocks as **one** atomic Undo step instead of N sub-steps.
     pub fn run_auto_simplify(&mut self, session: &mut DocumentSession) -> usize {
-        let _ = self.clear_auto_simplify(session);
-        self.enabled = true;
-        self.show_original = false;
         let objects = auto_simplify(&session.bitmap, Some(&self.palette), self.detail.clamp(1, 10));
-        self.generated_indices.clear();
-        for (k, mut obj) in objects.into_iter().enumerate() {
-            obj.object_id = Some(format!("{AUTO_SIMPLIFY_PREFIX}{k}"));
-            let idx = session.add_object(obj);
-            self.generated_indices.push(idx);
-        }
+        let palette_len = objects.len();
+        let mut indices = Vec::with_capacity(palette_len);
+        session.execute_batch(|session| {
+            let _ = self.clear_auto_simplify(session);
+            for (k, mut obj) in objects.into_iter().enumerate() {
+                obj.object_id = Some(format!("{AUTO_SIMPLIFY_PREFIX}{k}"));
+                indices.push(session.add_object(obj));
+            }
+        });
+        self.generated_indices = indices;
+        self.enabled = !self.generated_indices.is_empty();
+        self.show_original = false;
         self.generated_indices.len()
     }
 
-    /// Toggle `Show Original` preview by setting opacity `0%` vs `100%` on auto-generated Simplify blocks.
+    /// Toggle `Show Original` preview in place without polluting Undo history.
     pub fn set_show_original(&mut self, show_orig: bool, session: &mut DocumentSession) {
         self.show_original = show_orig;
         let target_opacity = if show_orig { 0.0 } else { 100.0 };
@@ -237,8 +259,28 @@ impl SimplifyUiFloatyState {
         for idx in indices {
             if let Some(mut updated) = session.page.capture_objects.get(idx).cloned() {
                 updated.opacity = Some(target_opacity);
-                let _ = session.update_object(idx, updated);
+                let _ = session.set_object_unrecorded(idx, updated);
             }
+        }
+    }
+
+    /// Keep `enabled` and `generated_indices` synchronized with `session` after Undo/Redo.
+    pub fn sync_from_session(&mut self, session: &DocumentSession) {
+        self.generated_indices = session
+            .page
+            .capture_objects
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| {
+                o.object_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with(AUTO_SIMPLIFY_PREFIX))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        self.enabled = !self.generated_indices.is_empty();
+        if !self.enabled {
+            self.show_original = false;
         }
     }
 }
