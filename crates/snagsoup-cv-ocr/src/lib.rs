@@ -21,7 +21,7 @@ pub use magic_wand::{
 pub use neural_ocr::{is_neural_ocr_available, locate_neural_ocr_models};
 pub use ocr::{
     available_ocr_languages, format_grab_text, grab_text, recognize_bitmap, recognize_rgba,
-    OcrDocument, OcrLine, OcrWord,
+    recognize_rgba_with_progress, OcrDocument, OcrLine, OcrWord,
 };
 pub use simplify_sui::auto_simplify;
 pub use smart_move::{detect_smart_objects, lift_smart_object, SmartElement};
@@ -392,5 +392,57 @@ mod tests {
             issues.iter().any(|i| matches!(i, TranslationIssue::TextOverflow { object_id, .. } if object_id == "c2")),
             "Expected TextOverflow warning for c2, got {issues:?}"
         );
+    }
+
+    #[test]
+    fn ocr_progress_callback_reports_monotonic_stages_and_cancellation() {
+        if available_ocr_languages().is_empty() {
+            return;
+        }
+        let w = 360u32;
+        let h = 90u32;
+        let mut pm = Pixmap::new(w, h).unwrap();
+        pm.fill(tiny_skia::Color::WHITE);
+        render_text_box(
+            &mut pm,
+            "Progress Bar Verification",
+            12.0,
+            12.0,
+            336.0,
+            64.0,
+            &TextRenderOptions {
+                font_family: "Segoe UI".to_string(),
+                font_size: 20.0,
+                color: ColorRgba::rgb(17, 24, 39),
+                bold: true,
+                h_align: HorizontalAlign::Left,
+                v_align: VerticalAlign::Center,
+                ..TextRenderOptions::default()
+            },
+            Transform::identity(),
+        );
+
+        let mut updates: Vec<(f32, String)> = Vec::new();
+        let doc = recognize_rgba_with_progress(w, h, pm.data(), None, |frac, stage| {
+            updates.push((frac, stage.to_string()));
+            true
+        })
+        .expect("recognize_rgba_with_progress");
+
+        assert!(doc.text.to_ascii_lowercase().contains("progress"));
+        assert!(updates.len() >= 2, "expected multiple progress stages, got {updates:?}");
+        for pair in updates.windows(2) {
+            assert!(
+                pair[1].0 >= pair[0].0,
+                "progress must be non-decreasing: {} -> {}",
+                pair[0].0,
+                pair[1].0
+            );
+        }
+        assert!((updates.last().unwrap().0 - 1.0).abs() < 1e-5);
+
+        // Returning false cancels immediately with CvOcrError::Cancelled
+        let cancel_res = recognize_rgba_with_progress(w, h, pm.data(), None, |frac, _| frac < 0.25);
+        assert!(matches!(cancel_res, Err(CvOcrError::Cancelled)));
     }
 }

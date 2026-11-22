@@ -1440,6 +1440,138 @@ impl EditorShellView {
         view
     }
 
+    /// Launch Offline Multilingual Neural OCR (`Grab Text`) asynchronously on a background worker
+    /// thread while displaying a live stage/percentage progress bar in the floating modal.
+    pub fn start_grab_text_async(&mut self, cx: &mut Context<Self>) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        enum OcrWorkerEvent {
+            Progress(f32, String),
+            Finished(Result<String, snagsoup_cv_ocr::CvOcrError>),
+        }
+
+        self.state.grab_edit_text.cancel_running_job();
+        let (rw, rh, rgba, scope) = super::smart_cv_ui::GrabEditTextUiState::prepare_grab_text_buffer(
+            &self.state.session,
+            self.state.active_selection_rect,
+        );
+
+        let job_id = self.state.grab_edit_text.active_job_id.wrapping_add(1);
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        self.state.grab_edit_text.active_job_id = job_id;
+        self.state.grab_edit_text.cancel_flag = Some(Arc::clone(&cancel_flag));
+        self.state.grab_edit_text.is_running = true;
+        self.state.grab_edit_text.progress = 0.04;
+        self.state.grab_edit_text.progress_stage = "Starting OCR engine...".to_string();
+        self.state.grab_edit_text.scope_label = scope.clone();
+        self.state.grab_edit_text.grabbed_text.clear();
+        self.state.grab_edit_text.copied_feedback = false;
+        self.state.grab_edit_text.modal_open = true;
+        self.state.status_message = format!("Scanning text in {scope}...");
+
+        let (tx, rx) = std::sync::mpsc::channel::<OcrWorkerEvent>();
+        let worker_cancel = Arc::clone(&cancel_flag);
+        let _ = std::thread::Builder::new()
+            .name("snagsoup-grab-text-ocr".into())
+            .spawn(move || {
+                let res = snagsoup_cv_ocr::recognize_rgba_with_progress(
+                    rw,
+                    rh,
+                    &rgba,
+                    None,
+                    |frac, stage| {
+                        if worker_cancel.load(Ordering::Relaxed) {
+                            return false;
+                        }
+                        let _ = tx.send(OcrWorkerEvent::Progress(frac, stage.to_string()));
+                        true
+                    },
+                )
+                .map(|doc| doc.text);
+                let _ = tx.send(OcrWorkerEvent::Finished(res));
+            });
+
+        cx.spawn(async move |weak, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(25))
+                    .await;
+
+                let mut done = false;
+                let mut latest_progress: Option<(f32, String)> = None;
+                let mut final_result: Option<Result<String, snagsoup_cv_ocr::CvOcrError>> = None;
+
+                while let Ok(ev) = rx.try_recv() {
+                    match ev {
+                        OcrWorkerEvent::Progress(p, stg) => {
+                            latest_progress = Some((p, stg));
+                        }
+                        OcrWorkerEvent::Finished(res) => {
+                            final_result = Some(res);
+                            done = true;
+                        }
+                    }
+                }
+
+                if latest_progress.is_some() || final_result.is_some() {
+                    let updated = weak.update(cx, |view, cx| {
+                        if view.state.grab_edit_text.active_job_id != job_id {
+                            return false;
+                        }
+                        if let Some((p, stg)) = latest_progress {
+                            view.state.grab_edit_text.progress = p.clamp(0.0, 1.0);
+                            view.state.grab_edit_text.progress_stage = stg;
+                        }
+                        if let Some(res) = final_result {
+                            view.state.grab_edit_text.is_running = false;
+                            view.state.grab_edit_text.cancel_flag = None;
+                            match res {
+                                Ok(text) => {
+                                    let trimmed = text.trim().to_string();
+                                    view.state.grab_edit_text.progress = 1.0;
+                                    view.state.grab_edit_text.grabbed_text = trimmed.clone();
+                                    if !trimmed.is_empty() {
+                                        let _ = snagsoup_win_platform::clipboard::write_text_to_clipboard(&trimmed);
+                                        view.state.grab_edit_text.copied_feedback = true;
+                                        let line_cnt = trimmed.lines().count();
+                                        view.state.status_message = format!(
+                                            "Grabbed {} chars ({} lines) from {} & copied to Clipboard",
+                                            trimmed.chars().count(),
+                                            line_cnt,
+                                            view.state.grab_edit_text.scope_label
+                                        );
+                                    } else {
+                                        view.state.grab_edit_text.copied_feedback = false;
+                                        view.state.status_message =
+                                            "OCR completed: no text detected in image".to_string();
+                                    }
+                                }
+                                Err(snagsoup_cv_ocr::CvOcrError::Cancelled) => {
+                                    view.state.grab_edit_text.modal_open = false;
+                                    view.state.status_message = "OCR cancelled".to_string();
+                                }
+                                Err(err) => {
+                                    view.state.grab_edit_text.modal_open = false;
+                                    view.state.status_message =
+                                        format!("Grab Text OCR failed: {err}");
+                                }
+                            }
+                        }
+                        cx.notify();
+                        true
+                    });
+                    if updated.map_or(true, |keep| !keep) {
+                        break;
+                    }
+                }
+
+                if done {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
     /// Render inline parameter controls for the selected Effect (`Border`, `Drop Shadow`, `Edges`,
     /// `Page Curl`, `Perspective`, `Color Filter`, `Color Adjustment`, `Color Replacement`,
     /// `Spotlight & Magnify`, `Caption`, `Auto Trim`, `Rotate`, `Flip`, `Scale Image`).
@@ -2965,14 +3097,19 @@ impl Render for EditorShellView {
                     .child(
                         Button::new(
                             "ed-grab-text",
-                            if compact_bar { "OCR" } else { "Grab Text" },
+                            if self.state.grab_edit_text.is_running {
+                                "Scanning..."
+                            } else if compact_bar {
+                                "OCR"
+                            } else {
+                                "Grab Text"
+                            },
                         )
+                            .disabled(self.state.grab_edit_text.is_running)
                             .variant(ButtonVariant::Secondary)
                             .tooltip("OCR Grab Text", Some("Extract text to Clipboard".into()))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                if let Err(err) = this.state.grab_text_to_clipboard() {
-                                    this.state.status_message = err;
-                                }
+                                this.start_grab_text_async(cx);
                                 cx.notify();
                             })),
                     )
@@ -4226,7 +4363,9 @@ impl Render for EditorShellView {
                     }
                     "escape" => {
                         if this.state.grab_edit_text.modal_open {
+                            this.state.grab_edit_text.cancel_running_job();
                             this.state.grab_edit_text.modal_open = false;
+                            this.state.status_message = "Closed Grab Text".to_string();
                         } else if this.state.pending_crop_rect.is_some() {
                             this.state.cancel_pending_crop();
                         } else {
@@ -4905,6 +5044,12 @@ impl Render for EditorShellView {
                                                     );
                                                 }
                                                 _ => {}
+                                            }
+                                        } else if this.state.active_tool == ToolMode::Selection {
+                                            if this.state.active_selection_rect.take().is_some() {
+                                                this.state.raster.selection_points.clear();
+                                                this.state.status_message =
+                                                    "Selection cleared".to_string();
                                             }
                                         }
                                     }
@@ -5627,8 +5772,16 @@ impl Render for EditorShellView {
                         ),
                 )
             })
-            // Snagit-Style `Grab Text` Floating Modal Dialog (overflow-safe, responsive, word-wrapped)
+            // Snagit-Style `Grab Text` Floating Modal Dialog (with live OCR Progress Bar & Results)
             .when(self.state.grab_edit_text.modal_open, |el| {
+                let is_running = self.state.grab_edit_text.is_running;
+                let progress = self.state.grab_edit_text.progress.clamp(0.0, 1.0);
+                let pct = (progress * 100.0).round() as u32;
+                let stage_lbl = if self.state.grab_edit_text.progress_stage.is_empty() {
+                    "Recognizing text...".to_string()
+                } else {
+                    self.state.grab_edit_text.progress_stage.clone()
+                };
                 let raw_txt = self.state.grab_edit_text.grabbed_text.trim().to_string();
                 let scope_lbl = if self.state.grab_edit_text.scope_label.is_empty() {
                     "Canvas".to_string()
@@ -5642,59 +5795,205 @@ impl Render for EditorShellView {
                     raw_txt.lines().count()
                 };
                 let copied_now = self.state.grab_edit_text.copied_feedback;
-                let modal_w = (viewport_w - 48.0).clamp(360.0, 640.0);
-                let modal_h = (viewport_h - 80.0).clamp(280.0, 440.0);
-
-                let mut text_lines_col = div()
-                    .id("grab-text-scroll-body")
-                    .flex()
-                    .flex_col()
-                    .gap(px(5.0))
-                    .w_full()
-                    .h_full()
-                    .px(px(14.0))
-                    .py(px(12.0))
-                    .overflow_y_scroll();
-
-                if raw_txt.is_empty() {
-                    text_lines_col = text_lines_col.child(
-                        div()
-                            .w_full()
-                            .text_sm()
-                            .text_color(theme.text_muted)
-                            .child("No readable text was detected in this region."),
-                    );
+                let modal_w = if is_running {
+                    (viewport_w - 48.0).clamp(340.0, 460.0)
                 } else {
-                    for line_str in raw_txt.lines() {
-                        let display_line = line_str.replace('\t', "    ");
+                    (viewport_w - 48.0).clamp(360.0, 640.0)
+                };
+                let modal_h = if is_running {
+                    216.0
+                } else {
+                    (viewport_h - 80.0).clamp(280.0, 440.0)
+                };
+
+                let body_el = if is_running {
+                    let track_w = (modal_w - 48.0).max(160.0);
+                    let fill_w = (track_w * progress).clamp(6.0, track_w);
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .justify_center()
+                        .gap(px(12.0))
+                        .px(px(24.0))
+                        .py(px(16.0))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_sm()
+                                        .text_color(theme.text_primary)
+                                        .truncate()
+                                        .child(stage_lbl),
+                                )
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_sm()
+                                        .font_weight(gpui::FontWeight::BOLD)
+                                        .text_color(theme.accent_primary)
+                                        .child(format!("{pct}%")),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .w(px(track_w))
+                                .h(px(10.0))
+                                .rounded(px(5.0))
+                                .bg(theme.border)
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .w(px(fill_w))
+                                        .rounded(px(5.0))
+                                        .bg(theme.accent_primary),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.text_muted)
+                                .child("Running offline neural OCR locally on device..."),
+                        )
+                        .into_any_element()
+                } else {
+                    let mut text_lines_col = div()
+                        .id("grab-text-scroll-body")
+                        .flex()
+                        .flex_col()
+                        .gap(px(5.0))
+                        .w_full()
+                        .h_full()
+                        .px(px(14.0))
+                        .py(px(12.0))
+                        .overflow_y_scroll();
+
+                    if raw_txt.is_empty() {
                         text_lines_col = text_lines_col.child(
                             div()
                                 .w_full()
-                                .min_w_0()
                                 .text_sm()
-                                .text_color(theme.text_primary)
-                                .child(if display_line.is_empty() {
-                                    " ".to_string()
-                                } else {
-                                    display_line
-                                }),
+                                .text_color(theme.text_muted)
+                                .child("No readable text was detected in this region."),
                         );
+                    } else {
+                        for line_str in raw_txt.lines() {
+                            let display_line = line_str.replace('\t', "    ");
+                            text_lines_col = text_lines_col.child(
+                                div()
+                                    .w_full()
+                                    .min_w_0()
+                                    .text_sm()
+                                    .text_color(theme.text_primary)
+                                    .child(if display_line.is_empty() {
+                                        " ".to_string()
+                                    } else {
+                                        display_line
+                                    }),
+                            );
+                        }
                     }
-                }
 
-                let scroll_shell = div()
-                    .flex()
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .rounded(theme.radius_sm)
-                    .bg(theme.input_bg)
-                    .border_1()
-                    .border_color(theme.border_strong)
-                    .overflow_hidden()
-                    .child(text_lines_col);
+                    let scroll_shell = div()
+                        .flex()
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .rounded(theme.radius_sm)
+                        .bg(theme.input_bg)
+                        .border_1()
+                        .border_color(theme.border_strong)
+                        .overflow_hidden()
+                        .child(text_lines_col);
+
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_h_0()
+                        .p(px(14.0))
+                        .overflow_hidden()
+                        .child(scroll_shell)
+                        .into_any_element()
+                };
+
+                let header_badge = if is_running {
+                    format!("{scope_lbl} · Scanning...")
+                } else {
+                    format!("{scope_lbl} · {line_cnt} lines · {char_cnt} chars")
+                };
 
                 let txt_for_copy = raw_txt.clone();
+                let footer_actions = if is_running {
+                    div()
+                        .flex()
+                        .flex_row()
+                        .flex_shrink_0()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            Button::new("grab-modal-cancel-btn", "Cancel")
+                                .variant(ButtonVariant::Secondary)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.state.grab_edit_text.cancel_running_job();
+                                    this.state.grab_edit_text.modal_open = false;
+                                    this.state.status_message = "OCR cancelled".to_string();
+                                    cx.notify();
+                                })),
+                        )
+                        .into_any_element()
+                } else {
+                    div()
+                        .flex()
+                        .flex_row()
+                        .flex_shrink_0()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            Button::new(
+                                "grab-modal-copy-btn",
+                                if copied_now { "Copied" } else { "Copy All" },
+                            )
+                            .icon(if copied_now {
+                                SnagIcon::Check
+                            } else {
+                                SnagIcon::Copy
+                            })
+                            .disabled(raw_txt.is_empty())
+                            .variant(if copied_now {
+                                ButtonVariant::Success
+                            } else {
+                                ButtonVariant::Primary
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if !txt_for_copy.is_empty() {
+                                    let _ = snagsoup_win_platform::clipboard::write_text_to_clipboard(
+                                        &txt_for_copy,
+                                    );
+                                    this.state.grab_edit_text.copied_feedback = true;
+                                    cx.notify();
+                                }
+                            })),
+                        )
+                        .child(
+                            Button::new("grab-modal-done-btn", "Close")
+                                .variant(ButtonVariant::Secondary)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.state.grab_edit_text.modal_open = false;
+                                    cx.notify();
+                                })),
+                        )
+                        .into_any_element()
+                };
+
                 el.child(
                     div()
                         .id("grab-text-modal-backdrop")
@@ -5708,9 +6007,11 @@ impl Render for EditorShellView {
                         .bg(rgba(0x00000066))
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.state.grab_edit_text.modal_open = false;
-                                cx.notify();
+                            cx.listener(move |this, _, _, cx| {
+                                if !is_running {
+                                    this.state.grab_edit_text.modal_open = false;
+                                    cx.notify();
+                                }
                             }),
                         )
                         .child(
@@ -5769,30 +6070,20 @@ impl Render for EditorShellView {
                                                         .text_xs()
                                                         .text_color(theme.text_secondary)
                                                         .truncate()
-                                                        .child(format!(
-                                                            "{scope_lbl} · {line_cnt} lines · {char_cnt} chars"
-                                                        )),
+                                                        .child(header_badge),
                                                 ),
                                         )
                                         .child(
                                             IconButton::new("grab-modal-close-x", SnagIcon::Close)
                                                 .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.state.grab_edit_text.cancel_running_job();
                                                     this.state.grab_edit_text.modal_open = false;
                                                     cx.notify();
                                                 })),
                                         ),
                                 )
-                                // Scrollable wrapped text body
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .flex_1()
-                                        .min_h_0()
-                                        .p(px(14.0))
-                                        .overflow_hidden()
-                                        .child(scroll_shell),
-                                )
+                                // Progress bar or scrollable wrapped text body
+                                .child(body_el)
                                 // Balanced non-overflowing bottom footer
                                 .child(
                                     div()
@@ -5814,55 +6105,13 @@ impl Render for EditorShellView {
                                                 .text_xs()
                                                 .text_color(theme.text_muted)
                                                 .truncate()
-                                                .child(
-                                                    "Tip: Select an area (M) first to grab a region",
-                                                ),
+                                                .child(if is_running {
+                                                    "Press Esc or Cancel to stop OCR"
+                                                } else {
+                                                    "Tip: Select an area (M) first to grab a region"
+                                                }),
                                         )
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .flex_row()
-                                                .flex_shrink_0()
-                                                .items_center()
-                                                .gap(px(8.0))
-                                                .child(
-                                                    Button::new(
-                                                        "grab-modal-copy-btn",
-                                                        if copied_now { "Copied" } else { "Copy All" },
-                                                    )
-                                                    .icon(if copied_now {
-                                                        SnagIcon::Check
-                                                    } else {
-                                                        SnagIcon::Copy
-                                                    })
-                                                    .disabled(raw_txt.is_empty())
-                                                    .variant(if copied_now {
-                                                        ButtonVariant::Success
-                                                    } else {
-                                                        ButtonVariant::Primary
-                                                    })
-                                                    .on_click(cx.listener(
-                                                        move |this, _, _, cx| {
-                                                            if !txt_for_copy.is_empty() {
-                                                                let _ = snagsoup_win_platform::clipboard::write_text_to_clipboard(&txt_for_copy);
-                                                                this.state.grab_edit_text.copied_feedback = true;
-                                                                cx.notify();
-                                                            }
-                                                        },
-                                                    )),
-                                                )
-                                                .child(
-                                                    Button::new("grab-modal-done-btn", "Close")
-                                                        .variant(ButtonVariant::Secondary)
-                                                        .on_click(cx.listener(
-                                                            |this, _, _, cx| {
-                                                                this.state.grab_edit_text.modal_open =
-                                                                    false;
-                                                                cx.notify();
-                                                            },
-                                                        )),
-                                                ),
-                                        ),
+                                        .child(footer_actions),
                                 ),
                         ),
                 )

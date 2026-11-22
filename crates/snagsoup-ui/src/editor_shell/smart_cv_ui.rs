@@ -4,6 +4,9 @@
 //! - Magic Wand (`magic_wand_select` Contiguous/Global + live Tolerance + marching-ants polylines)
 //! - Grab Text & Edit Text (`grab_text` modal + `edit_text_in_session`)
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use snagsoup_canvas::{DocumentSession, PixelRect, SceneCompositor};
 use snagsoup_cv_ocr::{
     MagicWandMode, SelectionMask, SmartElement, auto_simplify, detect_smart_objects,
@@ -118,6 +121,11 @@ impl MagicWandUiState {
 #[derive(Debug, Clone, Default)]
 pub struct GrabEditTextUiState {
     pub modal_open: bool,
+    pub is_running: bool,
+    pub progress: f32,
+    pub progress_stage: String,
+    pub active_job_id: u64,
+    pub cancel_flag: Option<Arc<AtomicBool>>,
     pub grabbed_text: String,
     pub scope_label: String,
     pub copied_feedback: bool,
@@ -125,34 +133,29 @@ pub struct GrabEditTextUiState {
 }
 
 impl GrabEditTextUiState {
-    /// Run Offline Multilingual Neural OCR `grab_text` on `session` (or just `selection` if a
-    /// marquee selection is active) and open the Snagit-style Grab Text Results modal.
-    pub fn run_grab_text(&mut self, session: &DocumentSession) -> Result<&str, String> {
-        self.run_grab_text_region(session, None)
+    /// Cancel any in-flight background OCR job and close or reset running state.
+    pub fn cancel_running_job(&mut self) {
+        if let Some(flag) = self.cancel_flag.take() {
+            flag.store(true, Ordering::Relaxed);
+        }
+        self.active_job_id = self.active_job_id.wrapping_add(1);
+        self.is_running = false;
     }
 
-    /// Region-aware Grab Text: flattens the active canvas (including vector callouts/text) and
-    /// extracts text from `selection` if `Some` (`>= 4×4 px`), or the entire canvas otherwise.
-    pub fn run_grab_text_region(
-        &mut self,
+    /// Flatten `session` (and crop `selection` if `>= 4×4 px`) into an RGBA8 buffer + scope label
+    /// ready for background or synchronous OCR execution.
+    pub fn prepare_grab_text_buffer(
         session: &DocumentSession,
         selection: Option<RectF>,
-    ) -> Result<&str, String> {
+    ) -> (u32, u32, Vec<u8>, String) {
         let comp = SceneCompositor::new(&session.page, Some(&session.bitmap));
         let (full_w, full_h, full_rgba) = match comp.flatten_to_rgba() {
             Ok(flat) => flat,
-            Err(_) => {
-                let text = grab_text(&session.bitmap, None)
-                    .map_err(|e| format!("Grab Text OCR failed: {e}"))?;
-                self.grabbed_text = text;
-                self.scope_label = format!(
-                    "Full Canvas ({}×{})",
-                    session.bitmap.width(),
-                    session.bitmap.height()
-                );
-                self.modal_open = true;
-                return Ok(&self.grabbed_text);
-            }
+            Err(_) => (
+                session.bitmap.width(),
+                session.bitmap.height(),
+                session.bitmap.to_rgba(),
+            ),
         };
 
         if let Some(sel) = selection.filter(|r| r.width >= 4.0 && r.height >= 4.0) {
@@ -170,18 +173,55 @@ impl GrabEditTextUiState {
                 sub_rgba[dst_off..(dst_off + (rw as usize) * 4)]
                     .copy_from_slice(&full_rgba[src_off..(src_off + (rw as usize) * 4)]);
             }
-
-            let doc = recognize_rgba(rw, rh, &sub_rgba, None)
-                .map_err(|e| format!("Grab Text OCR failed: {e}"))?;
-            self.grabbed_text = doc.text;
-            self.scope_label = format!("Selected Region ({rw}×{rh} px)");
+            (
+                rw,
+                rh,
+                sub_rgba,
+                format!("Selected Region ({rw}×{rh} px)"),
+            )
         } else {
-            let doc = recognize_rgba(full_w, full_h, &full_rgba, None)
-                .map_err(|e| format!("Grab Text OCR failed: {e}"))?;
-            self.grabbed_text = doc.text;
-            self.scope_label = format!("Full Canvas ({full_w}×{full_h} px)");
+            (
+                full_w,
+                full_h,
+                full_rgba,
+                format!("Full Canvas ({full_w}×{full_h} px)"),
+            )
         }
+    }
 
+    /// Run Offline Multilingual Neural OCR `grab_text` on `session` (or just `selection` if a
+    /// marquee selection is active) and open the Snagit-style Grab Text Results modal.
+    pub fn run_grab_text(&mut self, session: &DocumentSession) -> Result<&str, String> {
+        self.run_grab_text_region(session, None)
+    }
+
+    /// Region-aware Grab Text: flattens the active canvas (including vector callouts/text) and
+    /// extracts text from `selection` if `Some` (`>= 4×4 px`), or the entire canvas otherwise.
+    pub fn run_grab_text_region(
+        &mut self,
+        session: &DocumentSession,
+        selection: Option<RectF>,
+    ) -> Result<&str, String> {
+        self.cancel_running_job();
+        let (rw, rh, rgba, scope) = Self::prepare_grab_text_buffer(session, selection);
+        let doc = match recognize_rgba(rw, rh, &rgba, None) {
+            Ok(d) => d,
+            Err(_) if selection.is_none() => {
+                let text = grab_text(&session.bitmap, None)
+                    .map_err(|e| format!("Grab Text OCR failed: {e}"))?;
+                self.grabbed_text = text;
+                self.scope_label = scope;
+                self.progress = 1.0;
+                self.progress_stage = "Completed".to_string();
+                self.modal_open = true;
+                return Ok(&self.grabbed_text);
+            }
+            Err(e) => return Err(format!("Grab Text OCR failed: {e}")),
+        };
+        self.grabbed_text = doc.text;
+        self.scope_label = scope;
+        self.progress = 1.0;
+        self.progress_stage = "Completed".to_string();
         self.modal_open = true;
         Ok(&self.grabbed_text)
     }

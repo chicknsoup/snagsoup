@@ -1,4 +1,4 @@
-# SnagSoup v1.2.0.0
+# SnagSoup v1.3.0.0
 
 High-performance, 100% local-first multi-monitor screen capture, video recording, OCR, and annotation studio for Windows 10/11 — written in pure **Rust** on top of **GPUI DirectX 11**.
 
@@ -177,3 +177,9 @@ All captures, preferences, and SQLite FTS5 indexes stay 100% local under `%LOCAL
 - `Exports\` — Exported `.png`, `.jpg`, `.pdf`, `.svg`, and `.gif` files
 - `library.db` — SQLite WAL + FTS5 searchable capture database
 - `preferences.json` — Persisted Capture, General, Startup, and Hotkey preferences
+
+---
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).

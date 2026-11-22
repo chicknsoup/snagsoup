@@ -14,6 +14,9 @@ pub enum CvOcrError {
     #[error("OCR engine unavailable on this system (no OCR language packs installed)")]
     OcrUnavailable,
 
+    #[error("OCR operation cancelled")]
+    Cancelled,
+
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 }

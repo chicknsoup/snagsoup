@@ -1,6 +1,6 @@
 use crate::error::{CvOcrError, Result};
 use crate::neural_ocr::{
-    is_neural_ocr_available, recognize_rgba_neural, resize_gray_catmull_rom,
+    is_neural_ocr_available, recognize_rgba_neural_with_progress, resize_gray_catmull_rom,
     sort_ocr_lines_transitively,
 };
 use snagsoup_canvas::TiledBitmap;
@@ -64,6 +64,22 @@ pub fn recognize_rgba(
     rgba: &[u8],
     language_tag: Option<&str>,
 ) -> Result<OcrDocument> {
+    recognize_rgba_with_progress(width, height, rgba, language_tag, |_, _| true)
+}
+
+/// Recognizes text from an RGBA8 buffer while reporting incremental `(fraction_0_to_1, stage)`
+/// progress updates. Returning `false` from `on_progress` cancels recognition immediately with
+/// [`CvOcrError::Cancelled`].
+pub fn recognize_rgba_with_progress<F>(
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+    language_tag: Option<&str>,
+    mut on_progress: F,
+) -> Result<OcrDocument>
+where
+    F: FnMut(f32, &str) -> bool,
+{
     if width == 0 || height == 0 || rgba.len() < (width as usize) * (height as usize) * 4 {
         return Err(CvOcrError::InvalidInput(
             "Invalid RGBA dimensions or buffer length".to_string(),
@@ -86,13 +102,20 @@ pub fn recognize_rgba(
     };
 
     if prefer_neural {
-        if let Ok(doc) = recognize_rgba_neural(width, height, rgba) {
-            return Ok(doc);
+        match recognize_rgba_neural_with_progress(width, height, rgba, &mut on_progress) {
+            Ok(doc) => return Ok(doc),
+            Err(CvOcrError::Cancelled) => return Err(CvOcrError::Cancelled),
+            Err(_) => {}
         }
     }
 
+    if !on_progress(0.20, "Running Windows OCR fallback...") {
+        return Err(CvOcrError::Cancelled);
+    }
     let winrt_tag = language_tag.filter(|t| !t.eq_ignore_ascii_case("neural-latin-vi"));
-    recognize_rgba_winrt_enhanced(width, height, rgba, winrt_tag)
+    let doc = recognize_rgba_winrt_enhanced(width, height, rgba, winrt_tag)?;
+    let _ = on_progress(1.0, "Completed");
+    Ok(doc)
 }
 
 /// Enhanced `Windows.Media.Ocr` fallback: normalizes dark-mode polarity, upscales small screen

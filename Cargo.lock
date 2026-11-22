@@ -3564,7 +3564,7 @@ dependencies = [
 
 [[package]]
 name = "snagsoup-app"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "snagsoup-media",
  "snagsoup-ui",
@@ -3574,7 +3574,7 @@ dependencies = [
 
 [[package]]
 name = "snagsoup-canvas"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "base64",
  "fontdue",
@@ -3603,7 +3603,7 @@ dependencies = [
 
 [[package]]
 name = "snagsoup-cv-ocr"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "base64",
  "quick-xml 0.37.5",
@@ -3618,7 +3618,7 @@ dependencies = [
 
 [[package]]
 name = "snagsoup-library-export"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "base64",
  "chrono",
@@ -3650,7 +3650,7 @@ dependencies = [
 
 [[package]]
 name = "snagsoup-model"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "base64",
  "serde",
@@ -3661,7 +3661,7 @@ dependencies = [
 
 [[package]]
 name = "snagsoup-shellext"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "png 0.17.16",
  "snagsoup-model",

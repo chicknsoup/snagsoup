@@ -451,36 +451,41 @@ pub fn render_canvas_surface(
     }
 
     // 1. Persistent Selection Marquee (`ToolMode::Selection`)
-    if let Some(sel) = overlays.active_selection_rect {
+    if let Some(sel) = overlays.active_selection_rect.filter(|r| r.width >= 4.0 && r.height >= 4.0) {
         let rx = sel.x as f32 * eff_zoom;
         let ry = sel.y as f32 * eff_zoom;
         let rw = (sel.width as f32 * eff_zoom).max(2.0);
         let rh = (sel.height as f32 * eff_zoom).max(2.0);
-        canvas_box = canvas_box.child(
-            div()
-                .absolute()
-                .left(px(rx))
-                .top(px(ry))
-                .w(px(rw))
-                .h(px(rh))
-                .border_2()
-                .border_dashed()
-                .border_color(rgb(0x00A4E4))
-                .bg(rgba(0x00A4E418))
-                .child(
-                    div()
-                        .absolute()
-                        .left(px(0.0))
-                        .top(px(-22.0))
-                        .px(px(6.0))
-                        .py(px(2.0))
-                        .rounded(px(3.0))
-                        .bg(rgba(0x111827DD))
-                        .text_xs()
-                        .text_color(rgb(0xFFFFFF))
-                        .child(format!("{:.0} × {:.0} px", sel.width, sel.height)),
-                ),
-        );
+        let badge_text = format!("{:.0} × {:.0} px", sel.width, sel.height);
+        let (bx, by) = compute_marquee_badge_origin(rx, ry, rw, rh, scaled_w, scaled_h, 96.0);
+
+        canvas_box = canvas_box
+            .child(
+                div()
+                    .absolute()
+                    .left(px(rx))
+                    .top(px(ry))
+                    .w(px(rw))
+                    .h(px(rh))
+                    .border_2()
+                    .border_dashed()
+                    .border_color(rgb(0x00A4E4))
+                    .bg(rgba(0x00A4E418)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(bx))
+                    .top(px(by))
+                    .px(px(6.0))
+                    .py(px(2.0))
+                    .rounded(px(3.0))
+                    .bg(rgba(0x111827E6))
+                    .whitespace_nowrap()
+                    .text_xs()
+                    .text_color(rgb(0xFFFFFF))
+                    .child(badge_text),
+            );
     }
 
     // 2. Pending Crop Veil + 8 Handles (`ToolMode::Crop` awaiting Enter / ✓ Crop)
@@ -550,7 +555,12 @@ pub fn render_canvas_surface(
     }
 
     // 3. Live Region Drag Marquee (`Selection`, `Blur`, `Magnify`, `CutOut`, `Crop` while mouse button held)
-    if let Some((ref tool, drag_r)) = overlays.active_region_drag {
+    if let Some((tool, drag_r_ref)) = overlays
+        .active_region_drag
+        .as_ref()
+        .filter(|(_, r)| r.width >= 4.0 || r.height >= 4.0)
+    {
+        let drag_r = *drag_r_ref;
         let dx = drag_r.x as f32 * eff_zoom;
         let dy = drag_r.y as f32 * eff_zoom;
         let dw = (drag_r.width as f32 * eff_zoom).max(2.0);
@@ -561,36 +571,41 @@ pub fn render_canvas_surface(
             ToolMode::CutOut => (rgb(0xEF4444), rgba(0xEF444422)),
             _ => (rgb(0x00A4E4), rgba(0x00A4E41E)),
         };
-        canvas_box = canvas_box.child(
-            div()
-                .absolute()
-                .left(px(dx))
-                .top(px(dy))
-                .w(px(dw))
-                .h(px(dh))
-                .border_2()
-                .border_dashed()
-                .border_color(border_col)
-                .bg(tint_col)
-                .child(
-                    div()
-                        .absolute()
-                        .left(px(0.0))
-                        .top(px(-22.0))
-                        .px(px(6.0))
-                        .py(px(2.0))
-                        .rounded(px(3.0))
-                        .bg(rgba(0x111827DD))
-                        .text_xs()
-                        .text_color(rgb(0xFFFFFF))
-                        .child(format!(
-                            "{} · {:.0} × {:.0} px",
-                            tool.as_str(),
-                            drag_r.width,
-                            drag_r.height
-                        )),
-                ),
+        let badge_text = format!(
+            "{} · {:.0} × {:.0} px",
+            tool.as_str(),
+            drag_r.width,
+            drag_r.height
         );
+        let (bx, by) = compute_marquee_badge_origin(dx, dy, dw, dh, scaled_w, scaled_h, 152.0);
+
+        canvas_box = canvas_box
+            .child(
+                div()
+                    .absolute()
+                    .left(px(dx))
+                    .top(px(dy))
+                    .w(px(dw))
+                    .h(px(dh))
+                    .border_2()
+                    .border_dashed()
+                    .border_color(border_col)
+                    .bg(tint_col),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(bx))
+                    .top(px(by))
+                    .px(px(7.0))
+                    .py(px(2.0))
+                    .rounded(px(3.0))
+                    .bg(rgba(0x111827E6))
+                    .whitespace_nowrap()
+                    .text_xs()
+                    .text_color(rgb(0xFFFFFF))
+                    .child(badge_text),
+            );
     }
 
     // 4. Active Inline Text / Callout Editing Focus Frame + Caret Indicator
@@ -604,31 +619,35 @@ pub fn render_canvas_surface(
         } else {
             format!("{text_preview}|")
         };
-        canvas_box = canvas_box.child(
-            div()
-                .absolute()
-                .left(px(tx))
-                .top(px(ty))
-                .w(px(tw))
-                .h(px(th))
-                .border_2()
-                .border_dashed()
-                .border_color(rgb(0x2563EB))
-                .child(
-                    div()
-                        .absolute()
-                        .left(px(0.0))
-                        .top(px(-24.0))
-                        .max_w(px(360.0))
-                        .px(px(8.0))
-                        .py(px(2.0))
-                        .rounded(px(4.0))
-                        .bg(rgb(0x1D4ED8))
-                        .text_xs()
-                        .text_color(rgb(0xFFFFFF))
-                        .child(label),
-                ),
-        );
+        let (bx, by) = compute_marquee_badge_origin(tx, ty, tw, th, scaled_w, scaled_h, 220.0);
+        canvas_box = canvas_box
+            .child(
+                div()
+                    .absolute()
+                    .left(px(tx))
+                    .top(px(ty))
+                    .w(px(tw))
+                    .h(px(th))
+                    .border_2()
+                    .border_dashed()
+                    .border_color(rgb(0x2563EB)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(bx))
+                    .top(px(by))
+                    .max_w(px(360.0))
+                    .px(px(8.0))
+                    .py(px(2.0))
+                    .rounded(px(4.0))
+                    .bg(rgb(0x1D4ED8))
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .text_xs()
+                    .text_color(rgb(0xFFFFFF))
+                    .child(label),
+            );
     }
 
     surface = surface.child(canvas_box).when(show_grid, |el| {
@@ -648,6 +667,29 @@ pub fn render_canvas_surface(
     });
 
     surface
+}
+
+/// Position a floating marquee badge independently of the marquee's own width so narrow
+/// selections never wrap characters vertically, flipping below the marquee when near the
+/// top edge of the canvas and clamping horizontally within canvas bounds.
+pub fn compute_marquee_badge_origin(
+    rx: f32,
+    ry: f32,
+    _rw: f32,
+    rh: f32,
+    canvas_w: f32,
+    canvas_h: f32,
+    est_badge_w: f32,
+) -> (f32, f32) {
+    let bx = rx.clamp(0.0, (canvas_w - est_badge_w).max(0.0));
+    let by = if ry >= 26.0 {
+        ry - 24.0
+    } else if ry + rh + 26.0 <= canvas_h {
+        ry + rh + 6.0
+    } else {
+        (ry + 6.0).min((canvas_h - 22.0).max(0.0))
+    };
+    (bx, by)
 }
 
 #[cfg(test)]
@@ -691,5 +733,20 @@ mod tests {
         assert!((dx - 3.0).abs() < 1e-6);
         assert!((dy - 2.0).abs() < 1e-6);
         assert_eq!(guides.len(), 2);
+    }
+
+    #[test]
+    fn marquee_badge_origin_flips_below_near_top_and_clamps_right() {
+        // Normal middle selection: badge placed 24px above top-left
+        let (x1, y1) = compute_marquee_badge_origin(120.0, 80.0, 24.0, 154.0, 800.0, 600.0, 152.0);
+        assert_eq!((x1, y1), (120.0, 56.0));
+
+        // Near top edge (ry < 26): badge flips cleanly 6px below bottom of marquee
+        let (x2, y2) = compute_marquee_badge_origin(200.0, 10.0, 24.0, 154.0, 800.0, 600.0, 152.0);
+        assert_eq!((x2, y2), (200.0, 170.0));
+
+        // Near right edge: horizontal origin clamped so badge stays inside canvas
+        let (x3, _) = compute_marquee_badge_origin(760.0, 100.0, 24.0, 40.0, 800.0, 600.0, 152.0);
+        assert_eq!(x3, 648.0);
     }
 }

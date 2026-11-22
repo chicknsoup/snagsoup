@@ -146,17 +146,41 @@ impl DetectedBox {
 
 /// Recognize text from an RGBA8 screenshot buffer using the Offline Neural OCR pipeline.
 pub fn recognize_rgba_neural(width: u32, height: u32, rgba: &[u8]) -> Result<OcrDocument> {
+    recognize_rgba_neural_with_progress(width, height, rgba, |_, _| true)
+}
+
+/// Recognize text from an RGBA8 screenshot buffer while reporting incremental progress
+/// `(fraction_0_to_1, stage_description)`. Returning `false` from `on_progress` aborts early
+/// with [`CvOcrError::Cancelled`].
+pub fn recognize_rgba_neural_with_progress<F>(
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+    mut on_progress: F,
+) -> Result<OcrDocument>
+where
+    F: FnMut(f32, &str) -> bool,
+{
     if width == 0 || height == 0 || rgba.len() < (width as usize) * (height as usize) * 4 {
         return Err(CvOcrError::InvalidInput(
             "Invalid RGBA dimensions or buffer length".to_string(),
         ));
     }
+    if !on_progress(0.05, "Loading neural OCR engine...") {
+        return Err(CvOcrError::Cancelled);
+    }
     let engine = get_or_init_engine().ok_or(CvOcrError::OcrUnavailable)?;
 
     // 1. Alpha-composite onto white RGB buffer
+    if !on_progress(0.10, "Preparing image buffer...") {
+        return Err(CvOcrError::Cancelled);
+    }
     let rgb_buf = flatten_rgba_to_rgb(width, height, rgba);
 
     // 2. Detect text boxes with PP-OCRv4 DBNet
+    if !on_progress(0.14, "Detecting text regions...") {
+        return Err(CvOcrError::Cancelled);
+    }
     let mut raw_boxes = detect_text_boxes_dbnet(&engine.det_session, width, height, &rgb_buf)?;
 
     // Fallback for tight single-word/single-line crops where DBNet kernel might be too thin
@@ -172,25 +196,45 @@ pub fn recognize_rgba_neural(width: u32, height: u32, rgba: &[u8]) -> Result<Ocr
     }
 
     if raw_boxes.is_empty() {
+        let _ = on_progress(1.0, "Completed");
         return Ok(OcrDocument::default());
     }
 
     // 3. Group boxes into transitive horizontal row bands & merge close same-polarity words into phrases
     let phrase_boxes = group_and_merge_phrase_boxes(raw_boxes, width as f32, height as f32);
+    let total_boxes = phrase_boxes.len().max(1);
+    if !on_progress(
+        0.30,
+        &format!("Recognizing text (0 / {total_boxes})..."),
+    ) {
+        return Err(CvOcrError::Cancelled);
+    }
 
     // 4. Recognize each phrase crop via 64px Catmull-Rom + Polarity/Contrast Normalization + BiLSTM-CTC
     let mut lines: Vec<OcrLine> = Vec::with_capacity(phrase_boxes.len());
-    for b in phrase_boxes {
-        if let Some(line) = recognize_phrase_box(engine, width, height, &rgb_buf, &b)? {
+    for (idx, b) in phrase_boxes.iter().enumerate() {
+        if let Some(line) = recognize_phrase_box(engine, width, height, &rgb_buf, b)? {
             if !line.text.trim().is_empty() {
                 lines.push(line);
             }
         }
+        let done = idx + 1;
+        let frac = 0.30 + 0.66 * (done as f32 / total_boxes as f32);
+        if !on_progress(
+            frac.clamp(0.30, 0.96),
+            &format!("Recognizing text ({done} / {total_boxes})..."),
+        ) {
+            return Err(CvOcrError::Cancelled);
+        }
     }
 
     // 5. Final transitive row-band sort & structured plain-text formatting
+    if !on_progress(0.98, "Formatting extracted text...") {
+        return Err(CvOcrError::Cancelled);
+    }
     sort_ocr_lines_transitively(&mut lines);
     let formatted = format_grab_text(&lines);
+    let _ = on_progress(1.0, "Completed");
 
     Ok(OcrDocument {
         text: formatted,
