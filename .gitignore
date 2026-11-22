@@ -1,0 +1,38 @@
+# Rust / Cargo build outputs
+/target/
+**/*.rs.bk
+
+# Packaged release artifacts & bundled runtime models
+/dist/
+
+# Vendored external repositories & downloaded ONNX weights
+# (See README.md "Vendor Components & Integration Guide" for setup instructions)
+/vendor/
+
+# Local agent / workspace scratch configs & internal design notes
+/.agents/
+/docs/
+/plan/
+
+# Windows / MSVC debug & crash artifacts
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dmp
+
+# Editor & IDE metadata
+/.vscode/
+/.idea/
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Scratch test captures
+*.snagx
+*.mp4

@@ -1,0 +1,22 @@
+[package]
+name = "snagsoup-app"
+version = "1.1.0"
+edition = "2024"
+
+[[bin]]
+name = "snagsoup"
+path = "src/main.rs"
+
+[dependencies]
+snagsoup-media = { path = "../snagsoup-media" }
+snagsoup-ui = { path = "../snagsoup-ui" }
+snagsoup-win-platform = { path = "../snagsoup-win-platform" }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }

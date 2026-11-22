@@ -1,0 +1,26 @@
+[package]
+name = "snagsoup-cv-ocr"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+snagsoup-model = { path = "../snagsoup-model" }
+snagsoup-canvas = { path = "../snagsoup-canvas" }
+rayon = "1.10"
+serde_json = "1"
+thiserror = "2"
+base64 = "0.22"
+quick-xml = "0.37"
+windows = { version = "0.58", features = [
+    "AI",
+    "AI_MachineLearning",
+    "Media_Ocr",
+    "Graphics_Imaging",
+    "Storage_Streams",
+    "Globalization",
+    "Foundation",
+    "Foundation_Collections",
+] }
+
+[dev-dependencies]
+tiny-skia = "0.11"

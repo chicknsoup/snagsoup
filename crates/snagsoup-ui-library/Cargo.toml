@@ -1,0 +1,15 @@
+[package]
+name = "snagsoup-ui-library"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+image = { version = "0.25.1", default-features = false, features = ["png"] }
+smallvec = "1.6"
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["windows-manifest"] }
+snagsoup-model = { path = "../snagsoup-model" }
+snagsoup-canvas = { path = "../snagsoup-canvas" }
+snagsoup-cv-ocr = { path = "../snagsoup-cv-ocr" }
+snagsoup-media = { path = "../snagsoup-media" }
+snagsoup-library-export = { path = "../snagsoup-library-export" }
+snagsoup-win-platform = { path = "../snagsoup-win-platform" }
