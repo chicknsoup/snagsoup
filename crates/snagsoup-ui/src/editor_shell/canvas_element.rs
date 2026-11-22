@@ -19,10 +19,11 @@ use snagsoup_model::{PointF, RectF, ToolMode};
 use crate::theme::SnagTheme;
 
 /// Live interactive tool overlays painted on top of the canvas bitmap
-/// (marquee drag box, persistent `Selection`, pending `Crop` veil+handles, and inline text focus).
-#[derive(Debug, Clone, Default)]
+/// (marquee drag box, persistent `Selection`, pending `Crop` veil+handles, inline text focus,
+/// pixel-accurate `Magic Wand` selection mask, and `Smart Move` detected element boxes).
+#[derive(Clone, Default)]
 pub struct CanvasInteractiveOverlays {
-    /// Active drag rectangle for `Selection`, `Blur`, `Magnify`, `CutOut`, or `Crop`.
+    /// Active drag rectangle for `Selection`, `Blur`, `Magnify`, `CutOut`, `Simplify`, or `Crop`.
     pub active_region_drag: Option<(ToolMode, RectF)>,
     /// Persistent marquee rectangle after dragging with `ToolMode::Selection`.
     pub active_selection_rect: Option<RectF>,
@@ -30,6 +31,10 @@ pub struct CanvasInteractiveOverlays {
     pub pending_crop_rect: Option<RectF>,
     /// Active inline `Text` / `Callout` bounding box + live text with caret.
     pub editing_text_box: Option<(RectF, String)>,
+    /// Pixel-accurate `Magic Wand` cyan stripe & marching-ants silhouette `(canvas_rect, render_image)`.
+    pub magic_wand_overlay: Option<(RectF, Arc<RenderImage>)>,
+    /// `Smart Move` detected UI element bounding boxes `(canvas_rect, is_hovered)`.
+    pub smart_move_boxes: Vec<(RectF, bool)>,
 }
 
 /// Orientation of a pink Smart Alignment Guide line.
@@ -316,7 +321,31 @@ impl CanvasGpuCache {
         {
             if vis.width >= 1.0 && vis.height >= 1.0 {
                 let comp = SceneCompositor::new(&session.page, Some(&session.bitmap));
-                if let Ok((vw, vh, rgba)) = comp.render_viewport(vis, render_zoom) {
+                if let Ok((vw, vh, mut rgba)) = comp.render_viewport(vis, render_zoom) {
+                    // Composite any semi-transparent/erased pixels over an 8×8 light gray/white
+                    // checkerboard (#FFFFFF / #E2E8F0) for on-screen visibility while keeping
+                    // `session.bitmap` true alpha=0 intact for PNG/Clipboard exports!
+                    if rgba.chunks_exact(4).any(|px| px[3] < 255) {
+                        let w_u = vw as usize;
+                        for (i, px) in rgba.chunks_exact_mut(4).enumerate() {
+                            let a = px[3] as u32;
+                            if a < 255 {
+                                let x = i % w_u;
+                                let y = i / w_u;
+                                let even = ((x / 8) + (y / 8)) % 2 == 0;
+                                let (br, bg, bb) = if even {
+                                    (255u32, 255u32, 255u32)
+                                } else {
+                                    (226u32, 232u32, 240u32)
+                                };
+                                let inv = 255 - a;
+                                px[0] = ((px[0] as u32 * a + br * inv + 127) / 255) as u8;
+                                px[1] = ((px[1] as u32 * a + bg * inv + 127) / 255) as u8;
+                                px[2] = ((px[2] as u32 * a + bb * inv + 127) / 255) as u8;
+                                px[3] = 255;
+                            }
+                        }
+                    }
                     if let Some(render_img) = crate::rgba_to_bgra_render_image(vw, vh, &rgba) {
                         self.viewport_image = Some(render_img);
                         self.viewport_rect = vis;
@@ -648,6 +677,86 @@ pub fn render_canvas_surface(
                     .text_color(rgb(0xFFFFFF))
                     .child(label),
             );
+    }
+
+    // 5. Pixel-Accurate Magic Wand Selection Overlay (`ToolMode::MagicWand`)
+    if let Some((mw_rect, ref mw_img)) = overlays.magic_wand_overlay {
+        let mx = mw_rect.x as f32 * eff_zoom;
+        let my = mw_rect.y as f32 * eff_zoom;
+        let mw = (mw_rect.width as f32 * eff_zoom).max(2.0);
+        let mh = (mw_rect.height as f32 * eff_zoom).max(2.0);
+        let (bx, by) = compute_marquee_badge_origin(mx, my, mw, mh, scaled_w, scaled_h, 176.0);
+        canvas_box = canvas_box
+            .child(
+                img(mw_img.clone())
+                    .absolute()
+                    .left(px(mx))
+                    .top(px(my))
+                    .w(px(mw))
+                    .h(px(mh)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(bx))
+                    .top(px(by))
+                    .px(px(7.0))
+                    .py(px(2.0))
+                    .rounded(px(3.0))
+                    .bg(rgba(0x0F172AE6))
+                    .whitespace_nowrap()
+                    .text_xs()
+                    .text_color(rgb(0x38BDF8))
+                    .child(format!(
+                        "Magic Wand · {:.0}×{:.0} px (Del to clear)",
+                        mw_rect.width, mw_rect.height
+                    )),
+            );
+    }
+
+    // 6. Smart Move Detected UI Element Boxes (`ToolMode::Move` with Smart Move ON)
+    for &(sm_rect, is_hovered) in &overlays.smart_move_boxes {
+        let sx = sm_rect.x as f32 * eff_zoom;
+        let sy = sm_rect.y as f32 * eff_zoom;
+        let sw = (sm_rect.width as f32 * eff_zoom).max(4.0);
+        let sh = (sm_rect.height as f32 * eff_zoom).max(4.0);
+        canvas_box = canvas_box.child(
+            div()
+                .absolute()
+                .left(px(sx))
+                .top(px(sy))
+                .w(px(sw))
+                .h(px(sh))
+                .border_2()
+                .border_dashed()
+                .border_color(if is_hovered {
+                    rgb(0x2563EB)
+                } else {
+                    rgb(0x0EA5E9)
+                })
+                .bg(if is_hovered {
+                    rgba(0x2563EB26)
+                } else {
+                    rgba(0x0EA5E912)
+                }),
+        );
+        if is_hovered {
+            let (bx, by) = compute_marquee_badge_origin(sx, sy, sw, sh, scaled_w, scaled_h, 148.0);
+            canvas_box = canvas_box.child(
+                div()
+                    .absolute()
+                    .left(px(bx))
+                    .top(px(by))
+                    .px(px(7.0))
+                    .py(px(2.0))
+                    .rounded(px(3.0))
+                    .bg(rgb(0x2563EB))
+                    .whitespace_nowrap()
+                    .text_xs()
+                    .text_color(rgb(0xFFFFFF))
+                    .child("Drag to Smart Move"),
+            );
+        }
     }
 
     surface = surface.child(canvas_box).when(show_grid, |el| {

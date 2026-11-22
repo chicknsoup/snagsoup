@@ -23,6 +23,7 @@ use snagsoup_library_export::{
     LibraryDb, LibraryItem, MediaType, PdfPageSize, RasterExportFormat, export_pdf_bytes,
     export_raster_bytes, export_svg_string,
 };
+use snagsoup_cv_ocr::MagicWandMode;
 use snagsoup_model::{
     CaptureObject, ColorRgba, EffectConfig, PointF, RectF, SnagTemplate, SnagxArchive, SnagxIndex,
     SnagxMetadata, SnagxPage, SnagxPageEntry, ToolMode,
@@ -475,7 +476,74 @@ impl EditorShellState {
             self.status_message =
                 "Drag to adjust Crop box, then click ✓ Crop or press Enter".to_string();
         }
+        if matches!(
+            mode,
+            ToolMode::MagicWand
+                | ToolMode::Move
+                | ToolMode::SmartMove
+                | ToolMode::Simplify
+                | ToolMode::Shape
+                | ToolMode::Stamp
+                | ToolMode::Text
+                | ToolMode::Callout
+                | ToolMode::Crop
+        ) {
+            self.side_panel_tab = SidePanelTab::ToolProperties;
+        }
+        match mode {
+            ToolMode::MagicWand => {
+                self.status_message =
+                    "Magic Wand: click any color on canvas to select matching pixels (Del to clear)".into();
+            }
+            ToolMode::Move | ToolMode::SmartMove => {
+                self.status_message =
+                    "Move: drag annotations, or toggle Smart Move ON in Properties to move UI buttons".into();
+            }
+            ToolMode::Simplify => {
+                self.status_message =
+                    "Simplify: toggle Auto-Simplify in Properties or drag on canvas to cover areas".into();
+            }
+            _ => {}
+        }
         self.active_tool = mode;
+    }
+
+    /// Active RGB swatch converted to opaque `ColorRgba`.
+    pub fn active_color_rgba(&self) -> ColorRgba {
+        ColorRgba::rgb(
+            ((self.selected_color >> 16) & 0xFF) as u8,
+            ((self.selected_color >> 8) & 0xFF) as u8,
+            (self.selected_color & 0xFF) as u8,
+        )
+    }
+
+    /// Execute Undo (`Ctrl+Z`), keeping selection indices & active masks consistent.
+    pub fn perform_undo(&mut self) -> bool {
+        if self.session.undo() {
+            let len = self.session.page.capture_objects.len();
+            self.gizmos_g1.selected_indices.retain(|&i| i < len);
+            if self.editing_text_obj.is_some_and(|i| i >= len) {
+                self.editing_text_obj = None;
+            }
+            self.magic_wand.clear_selection();
+            self.status_message = "Undid last action (Ctrl+Z)".to_string();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Execute Redo (`Ctrl+Y` / `Ctrl+Shift+Z`), keeping selection indices consistent.
+    pub fn perform_redo(&mut self) -> bool {
+        if self.session.redo() {
+            let len = self.session.page.capture_objects.len();
+            self.gizmos_g1.selected_indices.retain(|&i| i < len);
+            self.magic_wand.clear_selection();
+            self.status_message = "Redid action (Ctrl+Y)".to_string();
+            true
+        } else {
+            false
+        }
     }
 
     pub fn start_editing_text_object(&mut self, obj_idx: usize) {
@@ -3032,8 +3100,7 @@ impl Render for EditorShellView {
                             .disabled(!can_undo)
                             .tooltip("Undo", Some("Ctrl+Z".into()))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                if this.state.session.undo() {
-                                    this.state.status_message = "Undid last action".to_string();
+                                if this.state.perform_undo() {
                                     cx.notify();
                                 }
                             })),
@@ -3041,10 +3108,9 @@ impl Render for EditorShellView {
                     .child(
                         IconButton::new("ed-redo", SnagIcon::Redo)
                             .disabled(!can_redo)
-                            .tooltip("Redo", Some("Ctrl+Y".into()))
+                            .tooltip("Redo", Some("Ctrl+Y / Ctrl+Shift+Z".into()))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                if this.state.session.redo() {
-                                    this.state.status_message = "Redid action".to_string();
+                                if this.state.perform_redo() {
                                     cx.notify();
                                 }
                             })),
@@ -3870,6 +3936,398 @@ impl Render for EditorShellView {
                     );
                 }
 
+                // Contextual 6: Magic Wand Controls (`ToolMode::MagicWand` or active Magic Wand mask)
+                if active_tool == ToolMode::MagicWand || self.state.magic_wand.active_mask.is_some() {
+                    let is_contig = self.state.magic_wand.mode == MagicWandMode::Contiguous;
+                    let mw_tol = self.state.magic_wand.tolerance;
+                    let mw_px = self.state.magic_wand.selected_pixel_count();
+                    props_col = props_col.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.0))
+                            .p(px(8.0))
+                            .rounded(theme.radius_sm)
+                            .bg(theme.surface_elevated)
+                            .border_1()
+                            .border_color(rgb(0x00A4E4))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(theme.text_primary)
+                                    .child(if mw_px > 0 {
+                                        format!("Magic Wand · {mw_px} px selected")
+                                    } else {
+                                        "Magic Wand · Click a color on canvas".to_string()
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap(px(4.0))
+                                    .child(
+                                        Button::new("mw-mode-contig", "Contiguous")
+                                            .variant(if is_contig {
+                                                ButtonVariant::Primary
+                                            } else {
+                                                ButtonVariant::Secondary
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.state.magic_wand.mode =
+                                                    MagicWandMode::Contiguous;
+                                                if let Some(cnt) = this
+                                                    .state
+                                                    .magic_wand
+                                                    .refresh_if_seeded(&this.state.session)
+                                                {
+                                                    this.state.status_message = format!(
+                                                        "Magic Wand (Contiguous): {cnt} px selected"
+                                                    );
+                                                }
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("mw-mode-global", "Global Color")
+                                            .variant(if !is_contig {
+                                                ButtonVariant::Primary
+                                            } else {
+                                                ButtonVariant::Secondary
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.state.magic_wand.mode = MagicWandMode::Global;
+                                                if let Some(cnt) = this
+                                                    .state
+                                                    .magic_wand
+                                                    .refresh_if_seeded(&this.state.session)
+                                                {
+                                                    this.state.status_message = format!(
+                                                        "Magic Wand (Global): {cnt} px selected"
+                                                    );
+                                                }
+                                                cx.notify();
+                                            })),
+                                    ),
+                            )
+                            .child(
+                                Slider::new("mw-tolerance", mw_tol, 1.0, 100.0)
+                                    .label("Tolerance")
+                                    .width(px(224.0))
+                                    .on_change(cx.listener(|this, &v: &f32, _, cx| {
+                                        this.state.magic_wand.tolerance = v.round();
+                                        let _ = this
+                                            .state
+                                            .magic_wand
+                                            .refresh_if_seeded(&this.state.session);
+                                        cx.notify();
+                                    })),
+                            )
+                            .when(mw_px > 0, |card| {
+                                card.child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .flex_wrap()
+                                        .gap(px(5.0))
+                                        .child(
+                                            Button::new("mw-del-btn", "Clear (Del)")
+                                                .variant(ButtonVariant::Capture)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    let n = this
+                                                        .state
+                                                        .magic_wand
+                                                        .delete_selected_pixels(
+                                                            &mut this.state.session,
+                                                        );
+                                                    this.state.status_message = format!(
+                                                        "Erased {n} px to transparent (Ctrl+Z to undo)"
+                                                    );
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("mw-fill-btn", "Fill Color")
+                                                .variant(ButtonVariant::Primary)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    let col = this.state.active_color_rgba();
+                                                    let n = this
+                                                        .state
+                                                        .magic_wand
+                                                        .fill_selected_pixels(
+                                                            &mut this.state.session,
+                                                            col,
+                                                        );
+                                                    this.state.status_message = format!(
+                                                        "Filled {n} px with #{:06X}",
+                                                        this.state.selected_color
+                                                    );
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("mw-copy-btn", "Copy")
+                                                .variant(ButtonVariant::Secondary)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    if let Some((w, h, data)) = this
+                                                        .state
+                                                        .magic_wand
+                                                        .copy_selected_pixels_rgba(
+                                                            &this.state.session,
+                                                        )
+                                                    {
+                                                        let _ = snagsoup_win_platform::clipboard::write_image_to_clipboard(
+                                                            &snagsoup_win_platform::clipboard::RgbaImage { width: w, height: h, data },
+                                                        );
+                                                        this.state.status_message = format!(
+                                                            "Copied Magic Wand cutout ({w}×{h} px)"
+                                                        );
+                                                        cx.notify();
+                                                    }
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("mw-desel-btn", "Deselect")
+                                                .variant(ButtonVariant::Ghost)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.state.magic_wand.clear_selection();
+                                                    cx.notify();
+                                                })),
+                                        ),
+                                )
+                            }),
+                    );
+                }
+
+                // Contextual 7: Smart Move Controls (`ToolMode::Move` / `ToolMode::SmartMove`)
+                if matches!(active_tool, ToolMode::Move | ToolMode::SmartMove) {
+                    let sm_on = self.state.smart_move.enabled;
+                    let sm_cnt = self.state.smart_move.detected.len();
+                    props_col = props_col.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.0))
+                            .p(px(8.0))
+                            .rounded(theme.radius_sm)
+                            .bg(theme.surface_elevated)
+                            .border_1()
+                            .border_color(if sm_on {
+                                gpui::Hsla::from(rgb(0x2563EB))
+                            } else {
+                                theme.border
+                            })
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(theme.text_primary)
+                                            .child("Smart Move (Auto-Detect UI)"),
+                                    )
+                                    .child(
+                                        Button::new(
+                                            "sm-toggle-btn",
+                                            if sm_on { "ON" } else { "OFF" },
+                                        )
+                                        .variant(if sm_on {
+                                            ButtonVariant::Primary
+                                        } else {
+                                            ButtonVariant::Secondary
+                                        })
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if this.state.smart_move.enabled {
+                                                this.state.smart_move.disable();
+                                                this.state.status_message =
+                                                    "Smart Move OFF — moving annotations only"
+                                                        .into();
+                                            } else {
+                                                let n = this
+                                                    .state
+                                                    .smart_move
+                                                    .scan(&this.state.session);
+                                                this.state.status_message = format!(
+                                                    "Smart Move ON: detected {n} movable UI elements — drag any box!"
+                                                );
+                                            }
+                                            cx.notify();
+                                        })),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.text_muted)
+                                    .child(if sm_on {
+                                        format!(
+                                            "{sm_cnt} UI elements detected. Hover & drag any highlighted box to move it and auto-fill the background."
+                                        )
+                                    } else {
+                                        "Turn ON to detect buttons, icons & text blocks inside flat screenshots so you can drag them anywhere."
+                                            .to_string()
+                                    }),
+                            )
+                            .when(sm_on, |card| {
+                                card.child(
+                                    Button::new("sm-rescan-btn", "↻ Re-scan Image")
+                                        .variant(ButtonVariant::Secondary)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            let n =
+                                                this.state.smart_move.scan(&this.state.session);
+                                            this.state.status_message =
+                                                format!("Re-scanned: {n} UI elements detected");
+                                            cx.notify();
+                                        })),
+                                )
+                            }),
+                    );
+                }
+
+                // Contextual 8: Simplify Controls (`ToolMode::Simplify`)
+                if active_tool == ToolMode::Simplify {
+                    let simp_on = self.state.simplify_ui.enabled;
+                    let simp_detail = self.state.simplify_ui.detail;
+                    let show_orig = self.state.simplify_ui.show_original;
+                    let pal_idx = self.state.simplify_ui.active_palette_idx;
+                    let palettes = SimplifyUiFloatyState::preset_palettes();
+
+                    let mut pal_row = div().flex().flex_row().flex_wrap().gap(px(4.0));
+                    for (p_i, pal) in palettes.iter().enumerate() {
+                        pal_row = pal_row.child(
+                            Button::new(format!("simp-pal-{p_i}"), pal.name.clone())
+                                .variant(if pal_idx == p_i {
+                                    ButtonVariant::Primary
+                                } else {
+                                    ButtonVariant::Secondary
+                                })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.state
+                                        .simplify_ui
+                                        .select_palette(p_i, &mut this.state.session);
+                                    cx.notify();
+                                })),
+                        );
+                    }
+
+                    props_col = props_col.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.0))
+                            .p(px(8.0))
+                            .rounded(theme.radius_sm)
+                            .bg(theme.surface_elevated)
+                            .border_1()
+                            .border_color(if simp_on {
+                                gpui::Hsla::from(rgb(0x2563EB))
+                            } else {
+                                theme.border
+                            })
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(theme.text_primary)
+                                            .child("Auto-Simplify (Wireframe)"),
+                                    )
+                                    .child(
+                                        Button::new(
+                                            "simp-auto-toggle",
+                                            if simp_on { "ON" } else { "Auto Simplify" },
+                                        )
+                                        .variant(if simp_on {
+                                            ButtonVariant::Primary
+                                        } else {
+                                            ButtonVariant::Capture
+                                        })
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if this.state.simplify_ui.enabled {
+                                                let n = this
+                                                    .state
+                                                    .simplify_ui
+                                                    .clear_auto_simplify(&mut this.state.session);
+                                                this.state.status_message = format!(
+                                                    "Removed {n} Auto-Simplify shapes"
+                                                );
+                                            } else {
+                                                let n = this
+                                                    .state
+                                                    .simplify_ui
+                                                    .run_auto_simplify(&mut this.state.session);
+                                                this.state.status_message = format!(
+                                                    "Auto-Simplify generated {n} wireframe blocks"
+                                                );
+                                            }
+                                            cx.notify();
+                                        })),
+                                    ),
+                            )
+                            .child(
+                                Slider::new("simp-detail", simp_detail as f32, 1.0, 10.0)
+                                    .label("Detail")
+                                    .width(px(224.0))
+                                    .on_change(cx.listener(|this, &v: &f32, _, cx| {
+                                        let next_d = v.round().clamp(1.0, 10.0) as u8;
+                                        if this.state.simplify_ui.detail != next_d {
+                                            this.state.simplify_ui.detail = next_d;
+                                            if this.state.simplify_ui.enabled {
+                                                let _ = this
+                                                    .state
+                                                    .simplify_ui
+                                                    .run_auto_simplify(&mut this.state.session);
+                                            }
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                            .child(pal_row)
+                            .when(simp_on, |card| {
+                                card.child(
+                                    Button::new(
+                                        "simp-show-orig",
+                                        if show_orig {
+                                            "👁 Showing Original (Click to Hide)"
+                                        } else {
+                                            "👁 Show Original"
+                                        },
+                                    )
+                                    .variant(if show_orig {
+                                        ButtonVariant::Primary
+                                    } else {
+                                        ButtonVariant::Secondary
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let next = !this.state.simplify_ui.show_original;
+                                        this.state
+                                            .simplify_ui
+                                            .set_show_original(next, &mut this.state.session);
+                                        cx.notify();
+                                    })),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.text_muted)
+                                    .child(
+                                        "Tip: Drag on the canvas anytime to draw manual cover blocks.",
+                                    ),
+                            ),
+                    );
+                }
+
                 props_col = props_col
                     .child(
                         NumericStepper::new("ed-stroke-width", self.state.stroke_width, 1.0, 64.0)
@@ -4155,6 +4613,11 @@ impl Render for EditorShellView {
             .focus_handle
             .get_or_insert_with(|| cx.focus_handle())
             .clone();
+        if self.state.workspace_view == WorkspaceView::Editor
+            && !focus_handle.contains_focused(window, cx)
+        {
+            focus_handle.focus(window, cx);
+        }
         let fh_for_canvas = focus_handle.clone();
         let fh_for_paint = focus_handle.clone();
         let entity_for_paint = cx.entity();
@@ -4182,11 +4645,36 @@ impl Render for EditorShellView {
             );
             Some((r, self.state.inline_text.content.clone()))
         });
+        let smart_move_boxes = if matches!(
+            self.state.active_tool,
+            ToolMode::Move | ToolMode::SmartMove
+        ) && self.state.smart_move.enabled
+        {
+            self.state
+                .smart_move
+                .detected
+                .iter()
+                .enumerate()
+                .map(|(i, el)| {
+                    let r = RectF::new(
+                        el.bounds.x as f64,
+                        el.bounds.y as f64,
+                        el.bounds.width as f64,
+                        el.bounds.height as f64,
+                    );
+                    (r, self.state.smart_move.hovered_idx == Some(i))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let overlays = CanvasInteractiveOverlays {
             active_region_drag,
             active_selection_rect: self.state.active_selection_rect,
             pending_crop_rect: self.state.pending_crop_rect,
             editing_text_box,
+            magic_wand_overlay: self.state.magic_wand.mask_overlay.clone(),
+            smart_move_boxes,
         };
         let pending_crop_for_bar = self.state.pending_crop_rect;
 
@@ -4356,7 +4844,9 @@ impl Render for EditorShellView {
                     return;
                 }
 
-                match key {
+                let shift = ev.keystroke.modifiers.shift;
+                let key_lower = key.to_ascii_lowercase();
+                match key_lower.as_str() {
                     "enter" if this.state.pending_crop_rect.is_some() => {
                         let _ = this.state.confirm_pending_crop();
                         cx.notify();
@@ -4368,6 +4858,9 @@ impl Render for EditorShellView {
                             this.state.status_message = "Closed Grab Text".to_string();
                         } else if this.state.pending_crop_rect.is_some() {
                             this.state.cancel_pending_crop();
+                        } else if this.state.magic_wand.active_mask.is_some() {
+                            this.state.magic_wand.clear_selection();
+                            this.state.status_message = "Cleared Magic Wand selection".to_string();
                         } else {
                             this.state.active_selection_rect = None;
                             this.state.close_all_popovers();
@@ -4375,7 +4868,15 @@ impl Render for EditorShellView {
                         cx.notify();
                     }
                     "backspace" | "delete" => {
-                        if this.state.active_selection_rect.is_some() {
+                        if this.state.magic_wand.active_mask.is_some() {
+                            let n = this
+                                .state
+                                .magic_wand
+                                .delete_selected_pixels(&mut this.state.session);
+                            this.state.status_message =
+                                format!("Erased {n} px to transparent (Ctrl+Z to undo)");
+                            cx.notify();
+                        } else if this.state.active_selection_rect.is_some() {
                             let _ = this.state.delete_selected_region();
                             cx.notify();
                         } else if !this.state.gizmos_g1.selected_indices.is_empty() {
@@ -4390,21 +4891,43 @@ impl Render for EditorShellView {
                             cx.notify();
                         }
                     }
-                    "c" if ctrl && this.state.active_selection_rect.is_some() => {
-                        if let Err(e) = this.state.copy_selected_region_to_clipboard() {
-                            this.state.status_message = e;
+                    "c" if ctrl => {
+                        if this.state.magic_wand.active_mask.is_some() {
+                            if let Some((w, h, data)) = this
+                                .state
+                                .magic_wand
+                                .copy_selected_pixels_rgba(&this.state.session)
+                            {
+                                let _ = snagsoup_win_platform::clipboard::write_image_to_clipboard(
+                                    &snagsoup_win_platform::clipboard::RgbaImage {
+                                        width: w,
+                                        height: h,
+                                        data,
+                                    },
+                                );
+                                this.state.status_message =
+                                    format!("Copied Magic Wand cutout ({w}×{h} px)");
+                                cx.notify();
+                            }
+                        } else if this.state.active_selection_rect.is_some() {
+                            if let Err(e) = this.state.copy_selected_region_to_clipboard() {
+                                this.state.status_message = e;
+                            }
+                            cx.notify();
                         }
-                        cx.notify();
+                    }
+                    "z" if ctrl && shift => {
+                        if this.state.perform_redo() {
+                            cx.notify();
+                        }
                     }
                     "z" if ctrl => {
-                        if this.state.session.undo() {
-                            this.state.status_message = "Undid last action".to_string();
+                        if this.state.perform_undo() {
                             cx.notify();
                         }
                     }
                     "y" if ctrl => {
-                        if this.state.session.redo() {
-                            this.state.status_message = "Redid action".to_string();
+                        if this.state.perform_redo() {
                             cx.notify();
                         }
                     }
@@ -4558,6 +5081,26 @@ impl Render for EditorShellView {
                                                         this.state.start_editing_text_object(h_idx);
                                                         cx.notify();
                                                         return;
+                                                    }
+                                                }
+                                            }
+                                            if hit.is_none() && this.state.smart_move.enabled {
+                                                if let Some(det_idx) =
+                                                    this.state.smart_move.hit_test_at(canvas_pt)
+                                                {
+                                                    if let Ok(obj_idx) = this
+                                                        .state
+                                                        .smart_move
+                                                        .lift_detected_index(
+                                                            &mut this.state.session,
+                                                            det_idx,
+                                                        )
+                                                    {
+                                                        this.state.gizmos_g1.selected_indices =
+                                                            vec![obj_idx];
+                                                        this.state.status_message =
+                                                            "Smart Move: lifted UI element & auto-filled background — drag to reposition!"
+                                                                .into();
                                                     }
                                                 }
                                             }
@@ -4765,17 +5308,15 @@ impl Render for EditorShellView {
                                                 .state
                                                 .magic_wand
                                                 .select_at(&this.state.session, x, y);
-                                            this.state.status_message =
-                                                format!("Magic Wand selected {count} px");
+                                            this.state.status_message = format!(
+                                                "Magic Wand selected {count} px — press Delete to clear or use Properties"
+                                            );
                                         }
                                         ToolMode::Simplify => {
-                                            let generated = this
-                                                .state
-                                                .simplify_ui
-                                                .run_auto_simplify(&mut this.state.session);
-                                            this.state.status_message = format!(
-                                                "Auto-Simplify created {generated} UI shapes"
-                                            );
+                                            this.state.active_drag = Some(CanvasDragOp::RegionTool {
+                                                start: canvas_pt,
+                                                current: canvas_pt,
+                                            });
                                         }
                                         _ => {}
                                     }
@@ -4806,7 +5347,21 @@ impl Render for EditorShellView {
                                 }
 
                                 let Some(drag) = this.state.active_drag.clone() else {
-                                    if is_brush_tool || has_spot_gizmo {
+                                    let mut needs_redraw = is_brush_tool || has_spot_gizmo;
+                                    if matches!(
+                                        this.state.active_tool,
+                                        ToolMode::Move | ToolMode::SmartMove
+                                    ) && this.state.smart_move.enabled
+                                    {
+                                        let hover_pt =
+                                            this.state.viewport.screen_to_canvas(local_x, local_y);
+                                        let next_hover = this.state.smart_move.hit_test_at(hover_pt);
+                                        if this.state.smart_move.hovered_idx != next_hover {
+                                            this.state.smart_move.hovered_idx = next_hover;
+                                            needs_redraw = true;
+                                        }
+                                    }
+                                    if needs_redraw {
                                         cx.notify();
                                     }
                                     return;
@@ -5040,6 +5595,33 @@ impl Render for EditorShellView {
                                                     ];
                                                     this.state.status_message = format!(
                                                         "Selected {:.0}×{:.0} px (Del to clear, Ctrl+C to copy)",
+                                                        w, h
+                                                    );
+                                                }
+                                                ToolMode::Simplify => {
+                                                    let fill_col = this
+                                                        .state
+                                                        .simplify_ui
+                                                        .palette
+                                                        .palette_colors
+                                                        .first()
+                                                        .copied()
+                                                        .unwrap_or_else(|| this.state.active_color_rgba());
+                                                    let obj = CaptureObject {
+                                                        tool_mode: Some(ToolMode::Simplify),
+                                                        start_point: Some(PointF::new(x, y)),
+                                                        end_point: Some(PointF::new(x + w, y + h)),
+                                                        background_color: Some(fill_col),
+                                                        foreground_color: Some(ColorRgba::TRANSPARENT),
+                                                        stroke_width: Some(0.0),
+                                                        corner_radius_ratio: Some(0.12),
+                                                        opacity: Some(100.0),
+                                                        ..CaptureObject::default()
+                                                    };
+                                                    let idx = this.state.session.add_object(obj);
+                                                    this.state.gizmos_g1.selected_indices = vec![idx];
+                                                    this.state.status_message = format!(
+                                                        "Placed {:.0}×{:.0} px Simplify block (Ctrl+Z to undo)",
                                                         w, h
                                                     );
                                                 }
