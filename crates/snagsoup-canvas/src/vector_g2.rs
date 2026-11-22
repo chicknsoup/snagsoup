@@ -330,6 +330,28 @@ pub fn render_svg_stamp_to_pixmap(svg_bytes: &[u8], width: u32, height: u32) -> 
     Some(pm)
 }
 
+/// Renders UTF-8 SVG bytes into straight (unpremultiplied) `RGBA8` pixels (`width * height * 4` bytes).
+pub fn render_svg_to_rgba(svg_bytes: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
+    let pm = render_svg_stamp_to_pixmap(svg_bytes, width, height)?;
+    let src = pm.data();
+    let mut out = vec![0u8; src.len()];
+    for (s, d) in src.chunks_exact(4).zip(out.chunks_exact_mut(4)) {
+        let a = s[3];
+        if a == 0 {
+            d.copy_from_slice(&[0, 0, 0, 0]);
+        } else if a == 255 {
+            d.copy_from_slice(s);
+        } else {
+            let af = a as u32;
+            d[0] = ((s[0] as u32 * 255 + af / 2) / af).min(255) as u8;
+            d[1] = ((s[1] as u32 * 255 + af / 2) / af).min(255) as u8;
+            d[2] = ((s[2] as u32 * 255 + af / 2) / af).min(255) as u8;
+            d[3] = a;
+        }
+    }
+    Some(out)
+}
+
 /// Draws an SVG stamp onto `pixmap` inside `obj`'s bounding rect.
 pub fn draw_svg_stamp(
     pixmap: &mut Pixmap,

@@ -36,7 +36,7 @@ pub use tile_bitmap::{encode_rgba_to_png, PixelRect, TileCoord, TiledBitmap, TIL
 pub use vector_g1::{hit_test_object, render_arrow, render_shape, render_step, render_stroke_tool};
 pub use vector_g2::{
     build_unified_callout_path, draw_svg_stamp, render_callout, render_svg_stamp_to_pixmap,
-    render_text_object,
+    render_svg_to_rgba, render_text_object,
 };
 
 #[cfg(test)]

@@ -4,15 +4,22 @@
 
 use crate::PlatformError;
 use snagsoup_model::{CaptureObject, PointF, ToolMode};
+use std::collections::HashMap;
 use std::mem::size_of;
-use std::ptr::null_mut;
-use windows_sys::Win32::Foundation::GetLastError;
+use std::ptr::{null, null_mut};
+use std::sync::{Mutex, OnceLock};
+use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC,
-    DeleteObject, GetDIBits, GetObjectW, HBITMAP,
+    BI_BITFIELDS, BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BITMAPV5HEADER, CreateBitmap,
+    CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDIBits,
+    GetObjectW, HBITMAP, ScreenToClient,
 };
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCapture;
+use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CURSOR_SHOWING, CURSORINFO, GetCursorInfo, GetIconInfoExW, ICONINFOEXW,
+    CURSOR_SHOWING, CURSORINFO, CreateIconIndirect, DestroyCursor, GetCursorInfo, GetCursorPos,
+    GetIconInfoExW, HCURSOR, HTCLIENT, ICONINFO, ICONINFOEXW, SendMessageW, SetCursor,
+    WM_MOUSEMOVE, WM_NCDESTROY, WM_SETCURSOR, WM_USER,
 };
 
 /// A captured mouse cursor bitmap + hotspot + virtual-screen coordinates.
@@ -270,6 +277,291 @@ fn extract_monochrome_cursor(hbm_mask: HBITMAP) -> Result<(u32, u32, Vec<u8>), P
     Ok((width, height, rgba))
 }
 
+/// Create a native Win32 32-bpp ARGB hardware cursor (`HCURSOR` returned as `isize`) from
+/// straight `RGBA8` pixel data (`width * height * 4` bytes) and hotspot `(hotspot_x, hotspot_y)`.
+pub fn create_argb_hcursor(
+    width: u32,
+    height: u32,
+    hotspot_x: u32,
+    hotspot_y: u32,
+    rgba: &[u8],
+) -> Result<isize, PlatformError> {
+    if width == 0 || height == 0 || rgba.len() != (width as usize) * (height as usize) * 4 {
+        return Err(PlatformError::ImageCodec(
+            "invalid cursor RGBA buffer dimensions".into(),
+        ));
+    }
+
+    let mut v5: BITMAPV5HEADER = unsafe { std::mem::zeroed() };
+    v5.bV5Size = size_of::<BITMAPV5HEADER>() as u32;
+    v5.bV5Width = width as i32;
+    v5.bV5Height = -(height as i32); // top-down DIB
+    v5.bV5Planes = 1;
+    v5.bV5BitCount = 32;
+    v5.bV5Compression = BI_BITFIELDS;
+    v5.bV5RedMask = 0x00FF_0000;
+    v5.bV5GreenMask = 0x0000_FF00;
+    v5.bV5BlueMask = 0x0000_00FF;
+    v5.bV5AlphaMask = 0xFF00_0000;
+
+    let mut bits_ptr: *mut core::ffi::c_void = null_mut();
+    let hbm_color = unsafe {
+        CreateDIBSection(
+            null_mut(),
+            &v5 as *const _ as *const BITMAPINFO,
+            DIB_RGB_COLORS,
+            &mut bits_ptr,
+            null_mut(),
+            0,
+        )
+    };
+    if hbm_color.is_null() || bits_ptr.is_null() {
+        return Err(PlatformError::Win32 {
+            api: "CreateDIBSection",
+            code: unsafe { GetLastError() },
+        });
+    }
+
+    // Write premultiplied BGRA8 into the DIB section and build matching 1-bpp AND mask.
+    let total_px = (width as usize) * (height as usize);
+    let dst_bgra = unsafe { std::slice::from_raw_parts_mut(bits_ptr as *mut u8, total_px * 4) };
+    let mask_row_bytes = (((width as usize) + 15) / 16) * 2;
+    let mut mask_bits = vec![0xFFu8; mask_row_bytes * (height as usize)];
+
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            let i = y * (width as usize) + x;
+            let r = rgba[i * 4] as u16;
+            let g = rgba[i * 4 + 1] as u16;
+            let b = rgba[i * 4 + 2] as u16;
+            let a = rgba[i * 4 + 3] as u16;
+
+            dst_bgra[i * 4] = ((b * a + 127) / 255) as u8;
+            dst_bgra[i * 4 + 1] = ((g * a + 127) / 255) as u8;
+            dst_bgra[i * 4 + 2] = ((r * a + 127) / 255) as u8;
+            dst_bgra[i * 4 + 3] = a as u8;
+
+            if a > 0 {
+                let byte_idx = y * mask_row_bytes + (x / 8);
+                let bit_mask = 0x80u8 >> (x % 8);
+                mask_bits[byte_idx] &= !bit_mask;
+            }
+        }
+    }
+
+    let hbm_mask = unsafe {
+        CreateBitmap(
+            width as i32,
+            height as i32,
+            1,
+            1,
+            mask_bits.as_ptr() as *const _,
+        )
+    };
+    if hbm_mask.is_null() {
+        unsafe {
+            DeleteObject(hbm_color);
+        }
+        return Err(PlatformError::Win32 {
+            api: "CreateBitmap",
+            code: unsafe { GetLastError() },
+        });
+    }
+
+    let icon_info = ICONINFO {
+        fIcon: 0, // FALSE -> create HCURSOR with hotspot
+        xHotspot: hotspot_x.min(width.saturating_sub(1)),
+        yHotspot: hotspot_y.min(height.saturating_sub(1)),
+        hbmMask: hbm_mask,
+        hbmColor: hbm_color,
+    };
+
+    let hcursor = unsafe { CreateIconIndirect(&icon_info) };
+    unsafe {
+        DeleteObject(hbm_color);
+        DeleteObject(hbm_mask);
+    }
+
+    if hcursor.is_null() {
+        return Err(PlatformError::Win32 {
+            api: "CreateIconIndirect",
+            code: unsafe { GetLastError() },
+        });
+    }
+    Ok(hcursor as isize)
+}
+
+/// Destroy a custom Win32 `HCURSOR` previously created by [`create_argb_hcursor`].
+pub fn destroy_hcursor(hcursor: isize) {
+    if hcursor != 0 {
+        unsafe {
+            let _ = DestroyCursor(hcursor as HCURSOR);
+        }
+    }
+}
+
+const CANVAS_CURSOR_SUBCLASS_ID: usize = 0x534E_4147; // 'SNAG'
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CanvasCursorEntry {
+    /// Active canvas client rectangle `(left, top, right, bottom)` in physical pixels.
+    rect_phys: Option<(i32, i32, i32, i32)>,
+    /// Custom `HCURSOR` (`0` = inactive, delegate to GPUI's standard cursor).
+    hcursor: isize,
+    subclassed: bool,
+}
+
+impl CanvasCursorEntry {
+    fn active_cursor_at(&self, client_x: i32, client_y: i32) -> Option<HCURSOR> {
+        if self.hcursor == 0 {
+            return None;
+        }
+        let (l, t, r, b) = self.rect_phys?;
+        if client_x >= l && client_x < r && client_y >= t && client_y < b {
+            Some(self.hcursor as HCURSOR)
+        } else {
+            None
+        }
+    }
+}
+
+fn canvas_cursor_map() -> &'static Mutex<HashMap<isize, CanvasCursorEntry>> {
+    static MAP: OnceLock<Mutex<HashMap<isize, CanvasCursorEntry>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cursor_client_pos(hwnd: HWND) -> Option<POINT> {
+    let mut pt = POINT { x: 0, y: 0 };
+    unsafe {
+        if GetCursorPos(&mut pt) == 0 {
+            return None;
+        }
+        if ScreenToClient(hwnd, &mut pt) == 0 {
+            return None;
+        }
+    }
+    Some(pt)
+}
+
+unsafe extern "system" fn canvas_cursor_subclass_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _uid_subclass: usize,
+    _dw_ref_data: usize,
+) -> LRESULT {
+    if msg == WM_NCDESTROY {
+        if let Ok(mut map) = canvas_cursor_map().lock() {
+            map.remove(&(hwnd as isize));
+        }
+        unsafe {
+            let _ = RemoveWindowSubclass(
+                hwnd,
+                Some(canvas_cursor_subclass_proc),
+                CANVAS_CURSOR_SUBCLASS_ID,
+            );
+            return DefSubclassProc(hwnd, msg, wparam, lparam);
+        }
+    }
+
+    if msg == WM_SETCURSOR && ((lparam & 0xFFFF) as u32 == HTCLIENT) {
+        if let Some(pt) = cursor_client_pos(hwnd) {
+            let custom = canvas_cursor_map()
+                .lock()
+                .ok()
+                .and_then(|map| map.get(&(hwnd as isize)).and_then(|e| e.active_cursor_at(pt.x, pt.y)));
+            if let Some(hcur) = custom {
+                unsafe {
+                    SetCursor(hcur);
+                }
+                return 1;
+            }
+        }
+    }
+
+    let res = unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) };
+
+    // Re-assert custom tool cursor if GPUI posted an internal cursor-style update or mouse-move
+    // while the pointer is inside the active Editor canvas.
+    if msg == WM_MOUSEMOVE || (WM_USER..=WM_USER + 16).contains(&msg) {
+        let cap = unsafe { GetCapture() };
+        if cap.is_null() || cap == hwnd {
+            if let Some(pt) = cursor_client_pos(hwnd) {
+                let custom = canvas_cursor_map()
+                    .lock()
+                    .ok()
+                    .and_then(|map| map.get(&(hwnd as isize)).and_then(|e| e.active_cursor_at(pt.x, pt.y)));
+                if let Some(hcur) = custom {
+                    unsafe {
+                        SetCursor(hcur);
+                    }
+                }
+            }
+        }
+    }
+
+    res
+}
+
+/// Synchronize the custom hardware `HCURSOR` scoped to `client_rect_phys` `(left, top, right, bottom)`
+/// inside `hwnd`. Pass `None` for `client_rect_phys` or `hcursor` when standard cursors should take over.
+pub fn sync_hwnd_canvas_cursor(
+    hwnd: isize,
+    client_rect_phys: Option<(i32, i32, i32, i32)>,
+    hcursor: Option<isize>,
+) {
+    if hwnd == 0 {
+        return;
+    }
+    let next_hcur = hcursor.unwrap_or(0);
+    let mut changed = false;
+    let mut need_subclass = false;
+
+    if let Ok(mut map) = canvas_cursor_map().lock() {
+        let entry = map.entry(hwnd).or_default();
+        if entry.rect_phys != client_rect_phys || entry.hcursor != next_hcur {
+            entry.rect_phys = client_rect_phys;
+            entry.hcursor = next_hcur;
+            changed = true;
+        }
+        if !entry.subclassed && next_hcur != 0 {
+            entry.subclassed = true;
+            need_subclass = true;
+        }
+    }
+
+    if need_subclass {
+        unsafe {
+            let _ = SetWindowSubclass(
+                hwnd as HWND,
+                Some(canvas_cursor_subclass_proc),
+                CANVAS_CURSOR_SUBCLASS_ID,
+                0,
+            );
+        }
+    }
+
+    // Immediately refresh hardware cursor if the tool changed while the mouse is resting inside the canvas.
+    if changed && next_hcur != 0 {
+        if let Some(pt) = cursor_client_pos(hwnd as HWND) {
+            if let Some((l, t, r, b)) = client_rect_phys {
+                if pt.x >= l && pt.x < r && pt.y >= t && pt.y < b {
+                    unsafe {
+                        SetCursor(next_hcur as HCURSOR);
+                    }
+                }
+            }
+        }
+    } else if changed && next_hcur == 0 {
+        let _ = null::<core::ffi::c_void>();
+        unsafe {
+            let lparam = ((WM_MOUSEMOVE as isize) << 16) | (HTCLIENT as isize);
+            let _ = SendMessageW(hwnd as HWND, WM_SETCURSOR, hwnd as WPARAM, lparam);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,5 +604,32 @@ mod tests {
             assert!(c.width > 0 && c.height > 0);
             assert_eq!(c.rgba.len(), (c.width as usize) * (c.height as usize) * 4);
         }
+    }
+
+    #[test]
+    fn create_argb_hcursor_roundtrips_hotspot_and_destroys_cleanly() {
+        let mut rgba = vec![0u8; 32 * 32 * 4];
+        // Opaque crosshair pixel at (7, 7)
+        let idx = (7 * 32 + 7) * 4;
+        rgba[idx..idx + 4].copy_from_slice(&[17, 24, 39, 255]);
+
+        let hcur = create_argb_hcursor(32, 32, 7, 7, &rgba).expect("create_argb_hcursor succeeds");
+        assert_ne!(hcur, 0);
+
+        let mut info: ICONINFOEXW = unsafe { std::mem::zeroed() };
+        info.cbSize = size_of::<ICONINFOEXW>() as u32;
+        let ok = unsafe { GetIconInfoExW(hcur as HCURSOR, &mut info) };
+        assert_ne!(ok, 0);
+        assert_eq!(info.fIcon, 0, "must be a cursor (fIcon == FALSE), not an icon");
+        assert_eq!((info.xHotspot, info.yHotspot), (7, 7));
+        unsafe {
+            if !info.hbmColor.is_null() {
+                DeleteObject(info.hbmColor);
+            }
+            if !info.hbmMask.is_null() {
+                DeleteObject(info.hbmMask);
+            }
+        }
+        destroy_hcursor(hcur);
     }
 }

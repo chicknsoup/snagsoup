@@ -46,6 +46,7 @@ use crate::editor_shell::raster_ui::RasterToolController;
 use crate::editor_shell::smart_cv_ui::{
     GrabEditTextUiState, MagicWandUiState, SimplifyUiFloatyState, SmartMoveUiState,
 };
+use crate::editor_shell::tool_cursor::cached_tool_hcursor;
 use crate::editor_shell::video_player::{
     VideoPlayerState, format_timestamp_ms, render_video_stage, render_video_timeline,
 };
@@ -457,6 +458,61 @@ impl EditorShellState {
             | ToolMode::DropZone
             | ToolMode::Unknown(_) => CursorStyle::Crosshair, // `IDC_CROSS`
         }
+    }
+
+    /// Resolve whether the Editor Canvas should display a custom tool-icon hardware cursor
+    /// (`Precision Crosshair + Tool Icon Badge`) or defer to a transient interaction cursor
+    /// (`ClosedHand` pan/move, `Spotlight` 8-handle resize arrows, `IBeam` active text caret,
+    /// `IDC_SIZEALL` Move / hovered Smart Move box, or open popovers/modals).
+    pub fn active_custom_tool_cursor_mode(&self) -> Option<ToolMode> {
+        if self.workspace_view != WorkspaceView::Editor
+            || self.video_player.path.is_some()
+            || self.show_create_menu
+            || self.show_share_menu
+            || self.show_more_tools
+            || self.grab_edit_text.modal_open
+        {
+            return None;
+        }
+        if self.viewport.space_panning
+            || matches!(
+                self.active_drag,
+                Some(
+                    CanvasDragOp::Pan { .. }
+                        | CanvasDragOp::MoveObject { .. }
+                        | CanvasDragOp::EffectSpotlight { .. }
+                )
+            )
+            || self.editing_text_obj.is_some()
+        {
+            return None;
+        }
+        if self.side_panel_tab == SidePanelTab::Effects {
+            if let (Some((_, spot_r)), Some((lx, ly))) = (
+                self.effects_gallery.active_spotlight_rect(),
+                self.hover_local_pos,
+            ) {
+                let eff_z = self.viewport.effective_logical_zoom().max(0.05);
+                let cpt = self.viewport.screen_to_canvas(lx, ly);
+                if EffectsGalleryState::hit_test_spotlight_gizmo(
+                    spot_r,
+                    cpt,
+                    (9.0 / eff_z).max(4.0) as f64,
+                )
+                .is_some()
+                {
+                    return None;
+                }
+            }
+        }
+        if self.active_tool == ToolMode::Move {
+            return None;
+        }
+        if self.active_tool == ToolMode::SmartMove && self.smart_move.hovered_idx.is_some() {
+            return None;
+        }
+        crate::editor_shell::tool_cursor::tool_cursor_svg(&self.active_tool)
+            .map(|_| self.active_tool.clone())
     }
 
     fn cursor_for_effect_gizmo_part(part: EffectGizmoPart) -> CursorStyle {
@@ -5440,6 +5496,16 @@ impl Render for EditorShellView {
         };
         let pending_crop_for_bar = self.state.pending_crop_rect;
 
+        if self.state.workspace_view != WorkspaceView::Editor || self.state.video_player.path.is_some() {
+            if let Some(hwnd) = snagsoup_ui_huds::extract_hwnd(window) {
+                snagsoup_win_platform::cursor::sync_hwnd_canvas_cursor(hwnd, None, None);
+            }
+        }
+        let custom_tool_hcursor = self
+            .state
+            .active_custom_tool_cursor_mode()
+            .and_then(|mode| cached_tool_hcursor(&mode, dev_scale));
+
         div()
             .id("editor-root-shell")
             .relative()
@@ -5707,6 +5773,18 @@ impl Render for EditorShellView {
                             cx.notify();
                         }
                     }
+                    _ if !ctrl && !ev.keystroke.modifiers.alt && !this.state.grab_edit_text.modal_open => {
+                        if let Some(found) = this
+                            .state
+                            .tools
+                            .iter()
+                            .find(|t| t.shortcut.is_some_and(|sc| sc.eq_ignore_ascii_case(&key_lower)))
+                            .map(|t| t.mode.clone())
+                        {
+                            this.state.select_tool(found);
+                            cx.notify();
+                        }
+                    }
                     _ => {}
                 }
             }))
@@ -5835,6 +5913,25 @@ impl Render for EditorShellView {
                                             .set((bounds.size.width.into(), bounds.size.height.into()));
                                     },
                                     move |bounds, _, window, cx| {
+                                        if let Some(hwnd) = snagsoup_ui_huds::extract_hwnd(window) {
+                                            let ox: f32 = bounds.origin.x.into();
+                                            let oy: f32 = bounds.origin.y.into();
+                                            let cw: f32 = bounds.size.width.into();
+                                            let ch: f32 = bounds.size.height.into();
+                                            let rect_phys = (cw > 1.0 && ch > 1.0).then(|| {
+                                                (
+                                                    (ox * dev_scale).round() as i32,
+                                                    (oy * dev_scale).round() as i32,
+                                                    ((ox + cw) * dev_scale).round() as i32,
+                                                    ((oy + ch) * dev_scale).round() as i32,
+                                                )
+                                            });
+                                            snagsoup_win_platform::cursor::sync_hwnd_canvas_cursor(
+                                                hwnd,
+                                                rect_phys,
+                                                custom_tool_hcursor,
+                                            );
+                                        }
                                         window.handle_input(
                                             &fh_for_paint,
                                             ElementInputHandler::new(
@@ -7332,5 +7429,45 @@ mod tests {
         assert!(st.perform_undo());
         assert_eq!(st.session.page.capture_objects.len(), objs_before_undo - 1);
         assert_eq!(st.session.bitmap.get_pixel(450, 280), Some([37, 99, 235, 255]));
+    }
+
+    #[test]
+    fn custom_tool_cursor_resolves_per_tool_and_yields_to_transient_modes() {
+        let mut st = EditorShellState::default();
+        assert_eq!(st.active_custom_tool_cursor_mode(), Some(ToolMode::Selection));
+
+        st.select_tool(ToolMode::Step);
+        assert_eq!(st.active_custom_tool_cursor_mode(), Some(ToolMode::Step));
+
+        st.select_tool(ToolMode::Arrow);
+        assert_eq!(st.active_custom_tool_cursor_mode(), Some(ToolMode::Arrow));
+
+        // Move uses native Win32 4-way IDC_SIZEALL cursor
+        st.select_tool(ToolMode::Move);
+        assert_eq!(st.active_custom_tool_cursor_mode(), None);
+
+        // Text shows Crosshair + Text icon before clicking, then yields to IBeam while typing!
+        st.select_tool(ToolMode::Text);
+        assert_eq!(st.active_custom_tool_cursor_mode(), Some(ToolMode::Text));
+        st.pointer_down(120.0, 100.0, false, 1);
+        st.pointer_up();
+        assert!(st.editing_text_obj.is_some());
+        assert_eq!(
+            st.active_custom_tool_cursor_mode(),
+            None,
+            "actively typing inside Text box must yield to IBeam"
+        );
+        st.finish_text_editing();
+        assert_eq!(st.active_custom_tool_cursor_mode(), Some(ToolMode::Text));
+
+        // Open popovers, modal dialogs, and Space-panning yield to standard cursors
+        st.show_more_tools = true;
+        assert_eq!(st.active_custom_tool_cursor_mode(), None);
+        st.show_more_tools = false;
+
+        st.viewport.space_panning = true;
+        assert_eq!(st.active_custom_tool_cursor_mode(), None);
+        st.viewport.space_panning = false;
+        assert_eq!(st.active_custom_tool_cursor_mode(), Some(ToolMode::Text));
     }
 }

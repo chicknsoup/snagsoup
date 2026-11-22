@@ -12,6 +12,7 @@ pub mod quickstyles;
 pub mod raster_ui;
 pub mod shell;
 pub mod smart_cv_ui;
+pub mod tool_cursor;
 pub mod video_player;
 
 pub use canvas_element::{
