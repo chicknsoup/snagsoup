@@ -10,15 +10,16 @@ use std::ptr::{null, null_mut};
 use std::sync::{Mutex, OnceLock};
 use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BI_BITFIELDS, BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BITMAPV5HEADER, CreateBitmap,
-    CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDIBits,
-    GetObjectW, HBITMAP, ScreenToClient,
+    BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateCompatibleDC,
+    CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDIBits, GetObjectW, HBITMAP,
+    ScreenToClient,
 };
+use windows_sys::Win32::UI::HiDpi::GetSystemMetricsForDpi;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetCapture;
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CURSOR_SHOWING, CURSORINFO, CreateIconIndirect, DestroyCursor, GetCursorInfo, GetCursorPos,
-    GetIconInfoExW, HCURSOR, HTCLIENT, ICONINFO, ICONINFOEXW, SendMessageW, SetCursor,
+    GetIconInfoExW, HCURSOR, HTCLIENT, ICONINFO, ICONINFOEXW, SM_CXCURSOR, SendMessageW, SetCursor,
     WM_MOUSEMOVE, WM_NCDESTROY, WM_SETCURSOR, WM_USER,
 };
 
@@ -277,8 +278,25 @@ fn extract_monochrome_cursor(hbm_mask: HBITMAP) -> Result<(u32, u32, Vec<u8>), P
     Ok((width, height, rgba))
 }
 
-/// Create a native Win32 32-bpp ARGB hardware cursor (`HCURSOR` returned as `isize`) from
-/// straight `RGBA8` pixel data (`width * height * 4` bytes) and hotspot `(hotspot_x, hotspot_y)`.
+/// Query the exact native Windows hardware cursor dimension (`SM_CXCURSOR` in physical pixels,
+/// e.g. `32` at 100%, `40` at 125%, `48` at 150%, `64` at 200%) so custom cursors never undergo
+/// nearest-neighbor resampling by `user32`.
+pub fn query_system_cursor_size_for_scale(scale_factor: f32) -> u32 {
+    let dpi = (scale_factor.clamp(1.0, 4.0) * 96.0).round() as u32;
+    let sys_px = unsafe { GetSystemMetricsForDpi(SM_CXCURSOR, dpi) };
+    if sys_px >= 16 {
+        sys_px as u32
+    } else {
+        ((32 * dpi + 48) / 96).max(32)
+    }
+}
+
+/// Create a native Win32 32-bpp `BI_RGB` alpha-blended hardware cursor (`HCURSOR` as `isize`)
+/// from straight `RGBA8` pixel data (`width * height * 4` bytes) and `(hotspot_x, hotspot_y)`.
+///
+/// Matches Windows 11's native `aero_*.cur` format (`BITMAPINFOHEADER` `BI_RGB` 32-bpp with
+/// straight unpremultiplied `BGRA8` so `win32k` performs single-pass per-pixel alpha blending
+/// without double-premultiplying anti-aliased edges).
 pub fn create_argb_hcursor(
     width: u32,
     height: u32,
@@ -292,23 +310,26 @@ pub fn create_argb_hcursor(
         ));
     }
 
-    let mut v5: BITMAPV5HEADER = unsafe { std::mem::zeroed() };
-    v5.bV5Size = size_of::<BITMAPV5HEADER>() as u32;
-    v5.bV5Width = width as i32;
-    v5.bV5Height = -(height as i32); // top-down DIB
-    v5.bV5Planes = 1;
-    v5.bV5BitCount = 32;
-    v5.bV5Compression = BI_BITFIELDS;
-    v5.bV5RedMask = 0x00FF_0000;
-    v5.bV5GreenMask = 0x0000_FF00;
-    v5.bV5BlueMask = 0x0000_00FF;
-    v5.bV5AlphaMask = 0xFF00_0000;
+    let mut bmi: BITMAPINFO = unsafe { std::mem::zeroed() };
+    bmi.bmiHeader = BITMAPINFOHEADER {
+        biSize: size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: width as i32,
+        biHeight: -(height as i32), // top-down 32-bpp BI_RGB DIB
+        biPlanes: 1,
+        biBitCount: 32,
+        biCompression: BI_RGB,
+        biSizeImage: 0,
+        biXPelsPerMeter: 0,
+        biYPelsPerMeter: 0,
+        biClrUsed: 0,
+        biClrImportant: 0,
+    };
 
     let mut bits_ptr: *mut core::ffi::c_void = null_mut();
     let hbm_color = unsafe {
         CreateDIBSection(
             null_mut(),
-            &v5 as *const _ as *const BITMAPINFO,
+            &bmi,
             DIB_RGB_COLORS,
             &mut bits_ptr,
             null_mut(),
@@ -322,7 +343,7 @@ pub fn create_argb_hcursor(
         });
     }
 
-    // Write premultiplied BGRA8 into the DIB section and build matching 1-bpp AND mask.
+    // Write straight BGRA8 into the 32-bpp BI_RGB DIB section and build matching 1-bpp AND mask.
     let total_px = (width as usize) * (height as usize);
     let dst_bgra = unsafe { std::slice::from_raw_parts_mut(bits_ptr as *mut u8, total_px * 4) };
     let mask_row_bytes = (((width as usize) + 15) / 16) * 2;
@@ -331,17 +352,19 @@ pub fn create_argb_hcursor(
     for y in 0..height as usize {
         for x in 0..width as usize {
             let i = y * (width as usize) + x;
-            let r = rgba[i * 4] as u16;
-            let g = rgba[i * 4 + 1] as u16;
-            let b = rgba[i * 4 + 2] as u16;
-            let a = rgba[i * 4 + 3] as u16;
+            let r = rgba[i * 4];
+            let g = rgba[i * 4 + 1];
+            let b = rgba[i * 4 + 2];
+            let a = rgba[i * 4 + 3];
 
-            dst_bgra[i * 4] = ((b * a + 127) / 255) as u8;
-            dst_bgra[i * 4 + 1] = ((g * a + 127) / 255) as u8;
-            dst_bgra[i * 4 + 2] = ((r * a + 127) / 255) as u8;
-            dst_bgra[i * 4 + 3] = a as u8;
+            if a == 0 {
+                dst_bgra[i * 4..i * 4 + 4].copy_from_slice(&[0, 0, 0, 0]);
+            } else {
+                dst_bgra[i * 4] = b;
+                dst_bgra[i * 4 + 1] = g;
+                dst_bgra[i * 4 + 2] = r;
+                dst_bgra[i * 4 + 3] = a;
 
-            if a > 0 {
                 let byte_idx = y * mask_row_bytes + (x / 8);
                 let bit_mask = 0x80u8 >> (x % 8);
                 mask_bits[byte_idx] &= !bit_mask;
@@ -608,10 +631,16 @@ mod tests {
 
     #[test]
     fn create_argb_hcursor_roundtrips_hotspot_and_destroys_cleanly() {
+        let sz_100 = query_system_cursor_size_for_scale(1.0);
+        let sz_125 = query_system_cursor_size_for_scale(1.25);
+        assert!(sz_100 >= 32 && sz_125 >= sz_100);
+
         let mut rgba = vec![0u8; 32 * 32 * 4];
-        // Opaque crosshair pixel at (7, 7)
+        // Opaque pixel at (7, 7) + semi-transparent anti-aliased white pixel at (8, 7)
         let idx = (7 * 32 + 7) * 4;
         rgba[idx..idx + 4].copy_from_slice(&[17, 24, 39, 255]);
+        let aa_idx = (7 * 32 + 8) * 4;
+        rgba[aa_idx..aa_idx + 4].copy_from_slice(&[255, 255, 255, 96]);
 
         let hcur = create_argb_hcursor(32, 32, 7, 7, &rgba).expect("create_argb_hcursor succeeds");
         assert_ne!(hcur, 0);
@@ -622,6 +651,17 @@ mod tests {
         assert_ne!(ok, 0);
         assert_eq!(info.fIcon, 0, "must be a cursor (fIcon == FALSE), not an icon");
         assert_eq!((info.xHotspot, info.yHotspot), (7, 7));
+
+        let (rw, rh, readback_rgba) =
+            extract_color_cursor(info.hbmColor, info.hbmMask).expect("readback 32-bpp BI_RGB");
+        assert_eq!((rw, rh), (32, 32));
+        assert_eq!(&readback_rgba[idx..idx + 4], &[17, 24, 39, 255]);
+        assert_eq!(
+            &readback_rgba[aa_idx..aa_idx + 4],
+            &[255, 255, 255, 96],
+            "8-bit straight alpha channel must survive CreateIconIndirect without 1-bit quantization"
+        );
+
         unsafe {
             if !info.hbmColor.is_null() {
                 DeleteObject(info.hbmColor);

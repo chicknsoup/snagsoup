@@ -7434,31 +7434,29 @@ mod tests {
     #[test]
     fn custom_tool_cursor_resolves_per_tool_and_yields_to_transient_modes() {
         let mut st = EditorShellState::default();
-        assert_eq!(st.active_custom_tool_cursor_mode(), Some(ToolMode::Selection));
+        // Selection, Move, Text, and Callout use standard OS cursors (Crosshair / OpenHand / IBeam)
+        assert_eq!(st.active_tool, ToolMode::Selection);
+        assert_eq!(st.active_custom_tool_cursor_mode(), None);
+        assert_eq!(st.canvas_cursor_style(), CursorStyle::Crosshair);
 
+        st.select_tool(ToolMode::Move);
+        assert_eq!(st.active_custom_tool_cursor_mode(), None);
+        assert_eq!(st.canvas_cursor_style(), CursorStyle::OpenHand);
+
+        st.select_tool(ToolMode::Text);
+        assert_eq!(st.active_custom_tool_cursor_mode(), None);
+        assert_eq!(st.canvas_cursor_style(), CursorStyle::IBeam);
+
+        st.select_tool(ToolMode::Callout);
+        assert_eq!(st.active_custom_tool_cursor_mode(), None);
+        assert_eq!(st.canvas_cursor_style(), CursorStyle::Crosshair);
+
+        // Drawing/CV tools use custom supersampled vector icon cursors
         st.select_tool(ToolMode::Step);
         assert_eq!(st.active_custom_tool_cursor_mode(), Some(ToolMode::Step));
 
         st.select_tool(ToolMode::Arrow);
         assert_eq!(st.active_custom_tool_cursor_mode(), Some(ToolMode::Arrow));
-
-        // Move uses native Win32 4-way IDC_SIZEALL cursor
-        st.select_tool(ToolMode::Move);
-        assert_eq!(st.active_custom_tool_cursor_mode(), None);
-
-        // Text shows Crosshair + Text icon before clicking, then yields to IBeam while typing!
-        st.select_tool(ToolMode::Text);
-        assert_eq!(st.active_custom_tool_cursor_mode(), Some(ToolMode::Text));
-        st.pointer_down(120.0, 100.0, false, 1);
-        st.pointer_up();
-        assert!(st.editing_text_obj.is_some());
-        assert_eq!(
-            st.active_custom_tool_cursor_mode(),
-            None,
-            "actively typing inside Text box must yield to IBeam"
-        );
-        st.finish_text_editing();
-        assert_eq!(st.active_custom_tool_cursor_mode(), Some(ToolMode::Text));
 
         // Open popovers, modal dialogs, and Space-panning yield to standard cursors
         st.show_more_tools = true;
@@ -7468,6 +7466,6 @@ mod tests {
         st.viewport.space_panning = true;
         assert_eq!(st.active_custom_tool_cursor_mode(), None);
         st.viewport.space_panning = false;
-        assert_eq!(st.active_custom_tool_cursor_mode(), Some(ToolMode::Text));
+        assert_eq!(st.active_custom_tool_cursor_mode(), Some(ToolMode::Arrow));
     }
 }

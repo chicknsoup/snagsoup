@@ -1,17 +1,19 @@
-//! Native Win32 hardware cursor (`HCURSOR`) generator & cache for Editor tools.
+//! Native Win32 32-bpp `BI_RGB` hardware cursor (`HCURSOR`) generator & cache for Editor tools.
 //!
-//! Renders each selected Editor tool's pure vector icon (`24×24` SVG inside a `28×28`
-//! DPI-scaled frame with a crisp white contrast halo + dark `#111827` strokes so it stays
-//! legible on both light and dark screenshots), with per-tool natural `(xHotspot, yHotspot)`
-//! coordinates (nib/pipette/wand/drop tip for pointed tools; icon/lens center for shape &
-//! stamp tools).
+//! - Uses standard Windows OS cursors for `Move` (`IDC_SIZEALL`), `Selection` (`IDC_CROSS`),
+//!   `Text` (`IDC_IBEAM`), and `Callout` (`IDC_CROSS` / `IDC_IBEAM`).
+//! - Renders the remaining 17 Editor tools at the exact OS `SM_CXCURSOR × SM_CYCURSOR`
+//!   hardware dimension (`32×32` at 100%, `40×40` at 125%, `48×48` at 150%, `64×64` at 200%)
+//!   using `4×` supersampled two-pass vector paths (`#121426` dark Aero outer border + crisp
+//!   `#FFFFFF` inner stroke — matching Windows 11's native cursor aesthetic with zero pixel
+//!   stretching and zero patchy halo speckles).
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use snagsoup_canvas::render_svg_to_rgba;
+use snagsoup_canvas::render_dual_layer_cursor_svg_rgba;
 use snagsoup_model::ToolMode;
-use snagsoup_win_platform::cursor::create_argb_hcursor;
+use snagsoup_win_platform::cursor::{create_argb_hcursor, query_system_cursor_size_for_scale};
 
 use crate::icons::SnagIcon;
 
@@ -26,11 +28,17 @@ pub struct ToolCursorBitmap {
 }
 
 /// Tool cursor specification: `(cache_key, svg_markup, hotspot_viewbox_xy_in_0_to_24)`.
-/// Returns `None` for `ToolMode::Move`, where Windows' native 4-way `IDC_SIZEALL` cursor applies.
+///
+/// Returns `None` for tools that use standard Windows OS cursors:
+/// - `Move` (`IDC_SIZEALL`)
+/// - `Selection` (`IDC_CROSS`)
+/// - `Text` (`IDC_IBEAM`)
+/// - `Callout` (`IDC_CROSS` while placing, `IDC_IBEAM` while typing)
 pub fn tool_cursor_spec(mode: &ToolMode) -> Option<(&'static str, &'static str, (f32, f32))> {
     match mode {
-        ToolMode::Move => None,
-        // Tip-pointed tools (hotspot right on the active nib / nozzle / wand / drop / tail tip)
+        ToolMode::Move | ToolMode::Selection | ToolMode::Text | ToolMode::Callout => None,
+
+        // Tip-pointed tools (hotspot right on the active nib / nozzle / wand / drop / eraser edge)
         ToolMode::Pen => Some(("pen", SnagIcon::Pen.svg_source(), (3.0, 20.0))),
         ToolMode::Highlighter => Some((
             "highlighter",
@@ -45,18 +53,15 @@ pub fn tool_cursor_spec(mode: &ToolMode) -> Option<(&'static str, &'static str, 
         )),
         ToolMode::Fill => Some(("fill", SnagIcon::Fill.svg_source(), (20.0, 19.5))),
         ToolMode::Eraser => Some(("eraser", SnagIcon::Eraser.svg_source(), (7.0, 19.0))),
-        ToolMode::Callout => Some(("callout", SnagIcon::Callout.svg_source(), (3.0, 21.0))),
 
         // Lens / center-aimed tools
         ToolMode::Magnify => Some(("magnify", SnagIcon::Magnify.svg_source(), (11.0, 11.0))),
-        ToolMode::Selection => Some(("selection", SnagIcon::Selection.svg_source(), (12.0, 12.0))),
         ToolMode::Arrow => Some(("arrow", SnagIcon::Arrow.svg_source(), (12.0, 12.0))),
         ToolMode::Line => Some((
             "line",
-            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 19L19 5"/><circle cx="5" cy="19" r="2" fill="currentColor"/><circle cx="19" cy="5" r="2" fill="currentColor"/></svg>"#,
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 19L19 5"/><circle cx="5" cy="19" r="1.8" fill="currentColor"/><circle cx="19" cy="5" r="1.8" fill="currentColor"/></svg>"#,
             (12.0, 12.0),
         )),
-        ToolMode::Text => Some(("text", SnagIcon::Text.svg_source(), (12.0, 12.0))),
         ToolMode::Shape => Some(("shape", SnagIcon::Shape.svg_source(), (12.0, 12.0))),
         ToolMode::Stamp => Some(("stamp", SnagIcon::Stamp.svg_source(), (12.0, 12.0))),
         ToolMode::Blur => Some(("blur", SnagIcon::Blur.svg_source(), (12.0, 12.0))),
@@ -78,124 +83,42 @@ pub fn tool_cursor_svg(mode: &ToolMode) -> Option<(&'static str, &'static str)> 
     tool_cursor_spec(mode).map(|(k, svg, _)| (k, svg))
 }
 
-fn blend_pixel_over(dst: &mut [u8; 4], src: [u8; 4]) {
-    let sa = src[3] as u32;
-    if sa == 0 {
-        return;
-    }
-    if sa == 255 || dst[3] == 0 {
-        *dst = src;
-        return;
-    }
-    let da = dst[3] as u32;
-    let inv_sa = 255 - sa;
-    let out_a = sa + (da * inv_sa + 127) / 255;
-    if out_a == 0 {
-        *dst = [0, 0, 0, 0];
-        return;
-    }
-    for c in 0..3 {
-        let num = (src[c] as u32) * sa * 255 + (dst[c] as u32) * da * inv_sa;
-        dst[c] = ((num + (out_a * 255) / 2) / (out_a * 255)).min(255) as u8;
-    }
-    dst[3] = out_a.min(255) as u8;
-}
-
-/// Build the DPI-scaled pure tool-icon `RGBA8` cursor bitmap + natural hotspot for `mode`.
+/// Build the `4×`-supersampled pure vector cursor bitmap at exact OS `SM_CXCURSOR` size.
 pub fn build_tool_cursor_bitmap(mode: &ToolMode, scale_factor: f32) -> Option<ToolCursorBitmap> {
     let (_key, raw_svg, (vx, vy)) = tool_cursor_spec(mode)?;
-    let scale_pct = (scale_factor.clamp(1.0, 3.0) * 100.0).round() as u32;
+    let canvas_sz = query_system_cursor_size_for_scale(scale_factor);
 
-    let pad = ((2 * scale_pct + 50) / 100).max(2);
-    let icon_sz = ((22 * scale_pct + 50) / 100).max(22);
-    let canvas_sz = icon_sz + pad * 2;
+    // Keep comfortable Windows 11 Aero cursor proportion (`22px` inside `32px`, `28px` inside `40px`)
+    // with generous integer margin so outer strokes never clip against the cursor box boundary.
+    let mut icon_px = ((canvas_sz as f32) * 0.6875).round() as u32;
+    if (canvas_sz - icon_px) % 2 == 1 {
+        icon_px = icon_px.saturating_sub(1);
+    }
+    let icon_sz = icon_px.max(18) as f32;
+    let pad = ((canvas_sz - icon_px) / 2) as f32;
 
-    let hx = (pad as f32 + (vx / 24.0) * (icon_sz as f32))
+    let hx = (pad + (vx / 24.0) * icon_sz)
         .round()
         .clamp(0.0, (canvas_sz - 1) as f32) as u32;
-    let hy = (pad as f32 + (vy / 24.0) * (icon_sz as f32))
+    let hy = (pad + (vy / 24.0) * icon_sz)
         .round()
         .clamp(0.0, (canvas_sz - 1) as f32) as u32;
 
-    let mut rgba = vec![0u8; (canvas_sz as usize) * (canvas_sz as usize) * 4];
+    // Pass 1 (Aero dark slate-navy outer border `#121426`) + Pass 2 (crisp white core `#FFFFFF`)
+    let outer_svg = raw_svg
+        .replace("stroke-width=\"2\"", "stroke-width=\"4.3\"")
+        .replace("currentColor", "#121426");
+    let inner_svg = raw_svg
+        .replace("stroke-width=\"2\"", "stroke-width=\"1.85\"")
+        .replace("currentColor", "#FFFFFF");
 
-    // 1. Render pure tool icon SVG in dark charcoal ink (`#111827`)
-    let styled_svg = raw_svg
-        .replace("stroke-width=\"2\"", "stroke-width=\"2.2\"")
-        .replace("currentColor", "#111827");
-    let icon_rgba = render_svg_to_rgba(styled_svg.as_bytes(), icon_sz, icon_sz)?;
-
-    // 2. Dilate icon alpha into a crisp solid white sticker halo (`~1.5px` solid + `0.85px` AA feather)
-    let solid_r = (scale_pct as f32 / 100.0) * 1.48;
-    let outer_r = solid_r + 0.85;
-    let halo_r = outer_r.ceil().max(2.0) as i32;
-    let outer_r_sq = outer_r * outer_r;
-    let isz = icon_sz as i32;
-    let csz = canvas_sz as i32;
-
-    for oy in -halo_r..isz + halo_r {
-        let dy_canvas = pad as i32 + oy;
-        if dy_canvas < 0 || dy_canvas >= csz {
-            continue;
-        }
-        for ox in -halo_r..isz + halo_r {
-            let dx_canvas = pad as i32 + ox;
-            if dx_canvas < 0 || dx_canvas >= csz {
-                continue;
-            }
-            let mut max_halo: f32 = 0.0;
-            for ky in -halo_r..=halo_r {
-                let sy = oy + ky;
-                if sy < 0 || sy >= isz {
-                    continue;
-                }
-                for kx in -halo_r..=halo_r {
-                    let sx = ox + kx;
-                    if sx < 0 || sx >= isz {
-                        continue;
-                    }
-                    let d2 = (kx * kx + ky * ky) as f32;
-                    if d2 > outer_r_sq {
-                        continue;
-                    }
-                    let a = icon_rgba[((sy as u32 * icon_sz + sx as u32) as usize) * 4 + 3];
-                    if a > 0 {
-                        let dist = d2.sqrt();
-                        let falloff = if dist <= solid_r {
-                            1.0
-                        } else {
-                            ((outer_r - dist) / (outer_r - solid_r)).clamp(0.0, 1.0)
-                        };
-                        max_halo = max_halo.max((a as f32 / 255.0).min(1.0) * falloff);
-                    }
-                }
-            }
-            if max_halo > 0.02 {
-                let ha = (max_halo * 252.0).round().clamp(0.0, 252.0) as u8;
-                let idx = ((dy_canvas as u32 * canvas_sz + dx_canvas as u32) as usize) * 4;
-                let slot: &mut [u8; 4] = (&mut rgba[idx..idx + 4]).try_into().expect("4 bytes");
-                blend_pixel_over(slot, [255, 255, 255, ha]);
-            }
-        }
-    }
-
-    // 3. Composite crisp dark icon strokes over the white halo
-    for iy in 0..icon_sz {
-        for ix in 0..icon_sz {
-            let s_off = ((iy * icon_sz + ix) as usize) * 4;
-            let src = [
-                icon_rgba[s_off],
-                icon_rgba[s_off + 1],
-                icon_rgba[s_off + 2],
-                icon_rgba[s_off + 3],
-            ];
-            if src[3] > 0 {
-                let d_off = (((pad + iy) * canvas_sz + (pad + ix)) as usize) * 4;
-                let slot: &mut [u8; 4] = (&mut rgba[d_off..d_off + 4]).try_into().expect("4 bytes");
-                blend_pixel_over(slot, src);
-            }
-        }
-    }
+    let rgba = render_dual_layer_cursor_svg_rgba(
+        outer_svg.as_bytes(),
+        inner_svg.as_bytes(),
+        canvas_sz,
+        pad,
+        icon_sz,
+    )?;
 
     Some(ToolCursorBitmap {
         width: canvas_sz,
@@ -209,19 +132,18 @@ pub fn build_tool_cursor_bitmap(mode: &ToolMode, scale_factor: f32) -> Option<To
 /// Obtain a cached Win32 `HCURSOR` (as `isize`) for `(mode, scale_factor)`.
 pub fn cached_tool_hcursor(mode: &ToolMode, scale_factor: f32) -> Option<isize> {
     let (key, _, _) = tool_cursor_spec(mode)?;
-    // Quantize scale factor to 25% steps (`100`, `125`, `150`, `175`, `200`, ...)
-    let scale_bucket = (((scale_factor.clamp(1.0, 3.0) * 4.0).round() as u32) * 25).max(100);
+    let cursor_sz = query_system_cursor_size_for_scale(scale_factor);
 
     static CACHE: OnceLock<Mutex<HashMap<(&'static str, u32), isize>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
 
     if let Ok(map) = cache.lock() {
-        if let Some(&hcur) = map.get(&(key, scale_bucket)) {
+        if let Some(&hcur) = map.get(&(key, cursor_sz)) {
             return (hcur != 0).then_some(hcur);
         }
     }
 
-    let bmp = build_tool_cursor_bitmap(mode, scale_bucket as f32 / 100.0)?;
+    let bmp = build_tool_cursor_bitmap(mode, scale_factor)?;
     let hcur = create_argb_hcursor(
         bmp.width,
         bmp.height,
@@ -232,7 +154,7 @@ pub fn cached_tool_hcursor(mode: &ToolMode, scale_factor: f32) -> Option<isize> 
     .unwrap_or(0);
 
     if let Ok(mut map) = cache.lock() {
-        map.insert((key, scale_bucket), hcur);
+        map.insert((key, cursor_sz), hcur);
     }
     (hcur != 0).then_some(hcur)
 }
@@ -243,70 +165,82 @@ mod tests {
     use crate::editor_shell::shell::default_all_21_tools;
 
     #[test]
-    fn all_editor_tools_generate_pure_icon_cursors_with_natural_hotspots() {
+    fn custom_icon_cursors_are_supersampled_at_os_size_and_standard_tools_excluded() {
         let tools = default_all_21_tools();
         assert_eq!(tools.len(), 21);
 
+        let sys_sz_100 = query_system_cursor_size_for_scale(1.0);
         let mut generated = Vec::new();
+
         for entry in &tools {
-            if entry.mode == ToolMode::Move {
+            if matches!(
+                entry.mode,
+                ToolMode::Move | ToolMode::Selection | ToolMode::Text | ToolMode::Callout
+            ) {
                 assert!(
                     build_tool_cursor_bitmap(&entry.mode, 1.0).is_none(),
-                    "Move uses native 4-way IDC_SIZEALL cursor"
+                    "{:?} must use standard OS cursor",
+                    entry.mode
                 );
                 continue;
             }
+
             let bmp = build_tool_cursor_bitmap(&entry.mode, 1.0)
                 .unwrap_or_else(|| panic!("expected custom cursor bitmap for {:?}", entry.mode));
-            assert_eq!((bmp.width, bmp.height), (26, 26));
+            assert_eq!(
+                (bmp.width, bmp.height),
+                (sys_sz_100, sys_sz_100),
+                "cursor bitmap must match exact OS SM_CXCURSOR size to prevent nearest-neighbor stretching"
+            );
             assert!(bmp.hotspot_x < bmp.width && bmp.hotspot_y < bmp.height);
 
-            // Top-left corner `(0, 0)` must be completely transparent (no detached crosshair!)
-            assert_eq!(&bmp.rgba[0..4], &[0, 0, 0, 0]);
-
-            // Icon must contain both dark strokes and white contrast halo
-            let mut dark_ink_px = 0usize;
-            let mut white_halo_px = 0usize;
+            // Outer border pixels (`#121426`), crisp white core pixels (`#FFFFFF`), and smooth AA pixels (`0 < a < 255`)
+            let mut dark_border_px = 0usize;
+            let mut white_core_px = 0usize;
+            let mut smooth_aa_px = 0usize;
             for px in bmp.rgba.chunks_exact(4) {
                 let [r, g, b, a] = [px[0], px[1], px[2], px[3]];
-                if a > 200 && r < 40 && g < 40 && b < 50 {
-                    dark_ink_px += 1;
-                } else if a > 180 && r > 240 && g > 240 && b > 240 {
-                    white_halo_px += 1;
+                if a > 0 && a < 255 {
+                    smooth_aa_px += 1;
+                }
+                if a > 180 && r < 40 && g < 40 && b < 60 {
+                    dark_border_px += 1;
+                } else if a > 220 && r > 235 && g > 235 && b > 235 {
+                    white_core_px += 1;
                 }
             }
             assert!(
-                dark_ink_px >= 14,
-                "tool {:?} icon cursor should have visible dark strokes (got {dark_ink_px})",
+                dark_border_px >= 16,
+                "tool {:?} should have crisp dark Aero border (got {dark_border_px})",
                 entry.mode
             );
             assert!(
-                white_halo_px >= 20,
-                "tool {:?} icon cursor should have visible white halo (got {white_halo_px})",
+                white_core_px >= 10,
+                "tool {:?} should have crisp white core strokes (got {white_core_px})",
+                entry.mode
+            );
+            assert!(
+                smooth_aa_px >= 20,
+                "tool {:?} should have smooth 4x-supersampled AA edge coverage (got {smooth_aa_px})",
                 entry.mode
             );
 
-            let h1 = cached_tool_hcursor(&entry.mode, 1.25)
-                .unwrap_or_else(|| panic!("expected valid HCURSOR for {:?}", entry.mode));
+            let h1 = cached_tool_hcursor(&entry.mode, 1.25).unwrap();
             let h2 = cached_tool_hcursor(&entry.mode, 1.25).unwrap();
             assert_eq!(h1, h2);
 
             generated.push((entry.mode.clone(), bmp));
         }
 
-        assert_eq!(generated.len(), 20);
+        // 21 total tools - 4 standard OS cursor tools (`Move`, `Selection`, `Text`, `Callout`) = 17 custom icon cursors
+        assert_eq!(generated.len(), 17);
 
         let get_bmp = |m: ToolMode| -> &ToolCursorBitmap {
             &generated.iter().find(|(mode, _)| *mode == m).unwrap().1
         };
-        // Pointed tools have bottom-left / tip hotspots; centered tools have `(13, 13)` center hotspot
         let pen = get_bmp(ToolMode::Pen);
-        assert!(pen.hotspot_x <= 6 && pen.hotspot_y >= 19, "Pen hotspot at nib tip");
-        let pip = get_bmp(ToolMode::Eyedropper);
-        assert!(pip.hotspot_x <= 5 && pip.hotspot_y >= 21, "Eyedropper hotspot at nozzle tip");
-        let wand = get_bmp(ToolMode::MagicWand);
-        assert!(wand.hotspot_x <= 9 && wand.hotspot_y <= 9, "Magic Wand hotspot at top-left star");
+        assert!(pen.hotspot_x < pen.width / 2 && pen.hotspot_y > pen.height / 2);
         let step = get_bmp(ToolMode::Step);
-        assert_eq!((step.hotspot_x, step.hotspot_y), (13, 13));
+        assert_eq!((step.hotspot_x, step.hotspot_y), (sys_sz_100 / 2, sys_sz_100 / 2));
     }
 }

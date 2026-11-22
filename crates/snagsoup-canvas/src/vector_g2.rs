@@ -352,6 +352,82 @@ pub fn render_svg_to_rgba(svg_bytes: &[u8], width: u32, height: u32) -> Option<V
     Some(out)
 }
 
+/// Renders a two-pass vector cursor (`outer_svg` casing + `inner_svg` core) at `4×` supersampling
+/// (`16×` subpixel box filter + `tiny_skia` analytical coverage) inside a `canvas_sz × canvas_sz`
+/// frame at `(pad, pad)` of size `icon_sz × icon_sz`, returning crisp straight `RGBA8` bytes.
+pub fn render_dual_layer_cursor_svg_rgba(
+    outer_svg: &[u8],
+    inner_svg: &[u8],
+    canvas_sz: u32,
+    pad: f32,
+    icon_sz: f32,
+) -> Option<Vec<u8>> {
+    if canvas_sz == 0 || icon_sz <= 0.0 {
+        return None;
+    }
+    const SS: u32 = 4;
+    let super_sz = canvas_sz * SS;
+    let opts = resvg::usvg::Options::default();
+    let outer_tree = resvg::usvg::Tree::from_data(outer_svg, &opts).ok()?;
+    let inner_tree = resvg::usvg::Tree::from_data(inner_svg, &opts).ok()?;
+
+    let mut super_pm = Pixmap::new(super_sz, super_sz)?;
+    let ss_f = SS as f32;
+
+    let out_size = outer_tree.size();
+    let t_outer = Transform::from_scale(
+        (icon_sz * ss_f) / out_size.width().max(1.0),
+        (icon_sz * ss_f) / out_size.height().max(1.0),
+    )
+    .post_translate(pad * ss_f, pad * ss_f);
+    resvg::render(&outer_tree, t_outer, &mut super_pm.as_mut());
+
+    let in_size = inner_tree.size();
+    let t_inner = Transform::from_scale(
+        (icon_sz * ss_f) / in_size.width().max(1.0),
+        (icon_sz * ss_f) / in_size.height().max(1.0),
+    )
+    .post_translate(pad * ss_f, pad * ss_f);
+    resvg::render(&inner_tree, t_inner, &mut super_pm.as_mut());
+
+    let src = super_pm.data();
+    let mut out = vec![0u8; (canvas_sz as usize) * (canvas_sz as usize) * 4];
+    let samples = SS * SS; // 16
+
+    for y in 0..canvas_sz {
+        for x in 0..canvas_sz {
+            let mut sum_pr = 0u32;
+            let mut sum_pg = 0u32;
+            let mut sum_pb = 0u32;
+            let mut sum_a = 0u32;
+
+            for sy in 0..SS {
+                let row_off = ((y * SS + sy) * super_sz + x * SS) as usize * 4;
+                for sx in 0..SS {
+                    let p = &src[row_off + (sx as usize) * 4..row_off + (sx as usize) * 4 + 4];
+                    sum_pr += p[0] as u32;
+                    sum_pg += p[1] as u32;
+                    sum_pb += p[2] as u32;
+                    sum_a += p[3] as u32;
+                }
+            }
+
+            let dst_off = ((y * canvas_sz + x) as usize) * 4;
+            let out_a = ((sum_a + samples / 2) / samples) as u8;
+            if out_a < 4 || sum_a == 0 {
+                out[dst_off..dst_off + 4].copy_from_slice(&[0, 0, 0, 0]);
+            } else {
+                // High-precision 12-bit unpremultiply before 8-bit rounding -> zero edge banding
+                out[dst_off] = ((sum_pr * 255 + sum_a / 2) / sum_a).min(255) as u8;
+                out[dst_off + 1] = ((sum_pg * 255 + sum_a / 2) / sum_a).min(255) as u8;
+                out[dst_off + 2] = ((sum_pb * 255 + sum_a / 2) / sum_a).min(255) as u8;
+                out[dst_off + 3] = out_a;
+            }
+        }
+    }
+    Some(out)
+}
+
 /// Draws an SVG stamp onto `pixmap` inside `obj`'s bounding rect.
 pub fn draw_svg_stamp(
     pixmap: &mut Pixmap,
