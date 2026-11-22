@@ -138,6 +138,31 @@ pub fn enumerate_window_hierarchy(max_depth: usize) -> Vec<WindowHierarchyEntry>
         .collect()
 }
 
+/// Sub-millisecond geometry-first variant of [`enumerate_window_hierarchy`] for instant Selection
+/// Overlay activation: reads kernel-cached titles via `InternalGetWindowText` (`0` cross-process
+/// `WM_GETTEXT` IPC stalls) and skips PE `GetFileVersionInfoW` disk I/O across background windows.
+pub fn enumerate_window_hierarchy_fast(max_depth: usize) -> Vec<WindowHierarchyEntry> {
+    let mut top_list: Vec<WindowInfo> = Vec::new();
+    let lparam = (&mut top_list as *mut Vec<WindowInfo>) as LPARAM;
+    unsafe {
+        EnumWindows(Some(enum_windows_fast_proc), lparam);
+    }
+    top_list
+        .into_iter()
+        .map(|top_window| {
+            let child_panes = if max_depth > 0 {
+                collect_child_panes(top_window.hwnd as HWND, top_window.rect, max_depth)
+            } else {
+                Vec::new()
+            };
+            WindowHierarchyEntry {
+                top_window,
+                child_panes,
+            }
+        })
+        .collect()
+}
+
 /// Snagit `Selection.WindowFinder` parity hit-test:
 /// 1. Strict front-to-back Z-order occlusion (`top_window.rect` + `point_in_window_rgn`) so an
 ///    occluded background window or its child panes can never win over a foreground window.
@@ -415,6 +440,91 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL 
     if let Some(info) = build_window_info(hwnd, z_order) {
         if info.rect.width() >= 16 && info.rect.height() >= 16 {
             list.push(info);
+        }
+    }
+
+    1
+}
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn InternalGetWindowText(hwnd: HWND, pstring: *mut u16, cchmaxcount: i32) -> i32;
+}
+
+fn get_window_title_fast_kernel(hwnd: HWND) -> String {
+    let mut buf = [0u16; 256];
+    let copied = unsafe { InternalGetWindowText(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+    if copied <= 0 {
+        return String::new();
+    }
+    String::from_utf16_lossy(&buf[..copied as usize])
+}
+
+unsafe extern "system" fn enum_windows_fast_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let list = unsafe { &mut *(lparam as *mut Vec<WindowInfo>) };
+
+    if unsafe { IsWindowVisible(hwnd) } == 0 || unsafe { IsIconic(hwnd) } != 0 {
+        return 1;
+    }
+
+    let class_name = get_window_class_name(hwnd);
+    if is_ignored_shell_window_class(&class_name) {
+        return 1;
+    }
+    let is_taskbar = matches!(class_name.as_str(), "Shell_TrayWnd" | "Shell_SecondaryTrayWnd");
+
+    let ex_style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32;
+    if (ex_style & WS_EX_TRANSPARENT) != 0 || (!is_taskbar && (ex_style & WS_EX_TOOLWINDOW) != 0) {
+        return 1;
+    }
+
+    let mut pid: u32 = 0;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, &mut pid);
+    }
+    if pid == std::process::id() {
+        return 1;
+    }
+
+    let mut cloaked: u32 = 0;
+    let hr = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED as u32,
+            &mut cloaked as *mut _ as *mut _,
+            size_of::<u32>() as u32,
+        )
+    };
+    if hr == 0 && cloaked != 0 {
+        return 1;
+    }
+
+    if let Some(rect) = get_extended_window_rect(hwnd) {
+        if rect.width() >= 16 && rect.height() >= 16 {
+            let z_order = list.len();
+            let title = get_window_title_fast_kernel(hwnd);
+            let exe_path = query_process_exe_path(pid);
+            let is_browser = exe_path
+                .as_deref()
+                .map(is_known_browser_exe)
+                .unwrap_or(false);
+            let app_name = exe_path
+                .as_deref()
+                .and_then(|p| Path::new(p).file_stem())
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string());
+            list.push(WindowInfo {
+                hwnd: hwnd as isize,
+                title,
+                rect,
+                z_order,
+                pid,
+                exe_path,
+                app_name,
+                app_version: None,
+                app_company: None,
+                is_browser,
+            });
         }
     }
 

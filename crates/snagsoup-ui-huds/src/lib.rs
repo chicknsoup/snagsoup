@@ -14,7 +14,7 @@ pub mod video_from_images_view;
 pub use all_in_one_hud::{AllInOneAction, AllInOneHudView, ResizeHandle};
 pub use exclude_capture::{
     WDA_EXCLUDEFROMCAPTURE, WDA_NONE, extract_hwnd, get_cursor_physical_pos,
-    get_window_exclude_from_capture, hide_window_hwnd, is_window_visible_hwnd,
+    get_window_exclude_from_capture, hide_window_hwnd, hide_windows_batch, is_window_visible_hwnd,
     position_window_physical, query_hwnd_physical_rect_and_dpi, restore_and_focus_hwnd,
     set_window_exclude_from_capture,
 };

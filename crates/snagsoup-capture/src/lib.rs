@@ -20,7 +20,9 @@ pub use scheduler::{CancellationToken, CaptureScheduler, ScheduleMode, hash_fram
 pub use selection_modes::{
     GuidelineResolution, SelectionResult, SelectionSession, SelectionTarget,
 };
-pub use wgc::{prewarm_wgc_device_pool, prewarm_wgc_monitor_sessions};
+pub use wgc::{
+    mark_wgc_sessions_dirty_for_window_hide, prewarm_wgc_device_pool, prewarm_wgc_monitor_sessions,
+};
 use std::fmt;
 
 /// Returns `true` if every pixel in an RGBA8/BGRA8 buffer has `R == 0 && G == 0 && B == 0`.

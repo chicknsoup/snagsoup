@@ -53,29 +53,43 @@ pub fn position_window_physical(
 /// force-disabled, drop any `HWND_TOPMOST` z-order, and call `DwmFlush()` so DWM composites
 /// the clean desktop immediately without any half-faded SnagSoup window or stale Z-order.
 pub fn hide_window_hwnd(hwnd: isize) -> bool {
-    if hwnd == 0 {
-        return false;
-    }
+    !hide_windows_batch(&[hwnd]).is_empty()
+}
+
+/// Hide multiple Win32 `HWND`s in one pass and execute at most **one** `DwmFlush()` across
+/// the entire batch (`0` flushes when none of `hwnds` were visible), returning the subset of
+/// `HWND`s that were actually visible and hidden.
+pub fn hide_windows_batch(hwnds: &[isize]) -> Vec<isize> {
+    let mut hidden = Vec::new();
     unsafe {
-        let _ = DwmSetWindowAttribute(
-            hwnd as HWND,
-            DWMWA_TRANSITIONS_FORCEDISABLED as u32,
-            &1u32 as *const _ as *const _,
-            size_of::<u32>() as u32,
-        );
-        let _ = SetWindowPos(
-            hwnd as HWND,
-            HWND_NOTOPMOST,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        );
-        let was_visible = ShowWindow(hwnd as HWND, SW_HIDE) != 0;
-        let _ = DwmFlush();
-        was_visible
+        for &hwnd in hwnds {
+            if hwnd == 0 || hidden.contains(&hwnd) || IsWindowVisible(hwnd as HWND) == 0 {
+                continue;
+            }
+            let _ = DwmSetWindowAttribute(
+                hwnd as HWND,
+                DWMWA_TRANSITIONS_FORCEDISABLED as u32,
+                &1u32 as *const _ as *const _,
+                size_of::<u32>() as u32,
+            );
+            let _ = SetWindowPos(
+                hwnd as HWND,
+                HWND_NOTOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            if ShowWindow(hwnd as HWND, SW_HIDE) != 0 {
+                hidden.push(hwnd);
+            }
+        }
+        if !hidden.is_empty() {
+            let _ = DwmFlush();
+        }
     }
+    hidden
 }
 
 /// Query whether a Win32 `HWND` is currently visible (`IsWindowVisible != 0`).

@@ -22,8 +22,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW,
 };
 
+type NotifyHook = Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
+
 static RECORDING_PAUSED: AtomicBool = AtomicBool::new(false);
-static LL_HOOK_SPECS: Mutex<Vec<(isize, HotkeySpec, mpsc::Sender<HotkeyEvent>)>> =
+static LL_HOOK_SPECS: Mutex<Vec<(isize, HotkeySpec, mpsc::Sender<HotkeyEvent>, NotifyHook)>> =
     Mutex::new(Vec::new());
 
 /// Action detected while polling Win32 keyboard state for interactive Hotkey Recording.
@@ -288,6 +290,7 @@ pub struct HotkeyManager {
     hwnd: isize,
     commands: Arc<Mutex<VecDeque<Command>>>,
     events_rx: Mutex<mpsc::Receiver<HotkeyEvent>>,
+    notify_cb: NotifyHook,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -301,13 +304,15 @@ impl HotkeyManager {
     pub fn new() -> Result<Self, PlatformError> {
         let commands = Arc::new(Mutex::new(VecDeque::<Command>::new()));
         let commands_bg = Arc::clone(&commands);
+        let notify_cb: NotifyHook = Arc::new(Mutex::new(None));
+        let notify_bg = Arc::clone(&notify_cb);
         let (events_tx, events_rx) = mpsc::channel::<HotkeyEvent>();
         let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<isize, PlatformError>>(1);
 
         let handle = thread::Builder::new()
             .name("snagsoup-hotkey-loop".to_string())
             .spawn(move || {
-                hotkey_thread_main(commands_bg, events_tx, ready_tx);
+                hotkey_thread_main(commands_bg, notify_bg, events_tx, ready_tx);
             })
             .map_err(|_| PlatformError::HotkeyThreadStopped)?;
 
@@ -319,8 +324,17 @@ impl HotkeyManager {
             hwnd,
             commands,
             events_rx: Mutex::new(events_rx),
+            notify_cb,
             thread: Some(handle),
         })
+    }
+
+    /// Register an instant wake callback invoked immediately (`< 0.1ms`) on the hotkey thread
+    /// whenever `WM_HOTKEY` or the `WH_KEYBOARD_LL` fallback fires an event.
+    pub fn set_on_event_callback(&self, cb: impl Fn() + Send + Sync + 'static) {
+        if let Ok(mut guard) = self.notify_cb.lock() {
+            *guard = Some(Arc::new(cb));
+        }
     }
 
     /// Dynamically register a global hotkey.
@@ -401,6 +415,7 @@ impl Drop for HotkeyManager {
 
 fn hotkey_thread_main(
     commands: Arc<Mutex<VecDeque<Command>>>,
+    notify_cb: NotifyHook,
     events_tx: mpsc::Sender<HotkeyEvent>,
     ready_tx: mpsc::SyncSender<Result<isize, PlatformError>>,
 ) {
@@ -468,6 +483,9 @@ fn hotkey_thread_main(
                     let _ = events_tx.send(HotkeyEvent {
                         id: msg.wParam as i32,
                     });
+                    if let Some(cb) = notify_cb.lock().ok().and_then(|g| g.clone()) {
+                        cb();
+                    }
                 }
             }
             WM_APP_COMMAND => {
@@ -488,14 +506,16 @@ fn hotkey_thread_main(
                                 unsafe { UnhookWindowsHookEx(ll_hook) };
                                 ll_hook = null_mut();
                                 if let Ok(mut list) = LL_HOOK_SPECS.lock() {
-                                    list.retain(|(owner, _, _)| *owner != owner_key);
+                                    list.retain(|(owner, _, _, _)| *owner != owner_key);
                                 }
                             }
                             let _ = reply.send(!ll_hook.is_null() || !enabled);
                         }
                         Command::Register { spec, reply } => {
                             if let Ok(mut list) = LL_HOOK_SPECS.lock() {
-                                list.retain(|(owner, s, _)| !(owner == &owner_key && s.id == spec.id));
+                                list.retain(|(owner, s, _, _)| {
+                                    !(owner == &owner_key && s.id == spec.id)
+                                });
                             }
                             let ok = unsafe {
                                 RegisterHotKey(hwnd, spec.id, spec.modifiers.bits(), spec.vk)
@@ -507,7 +527,12 @@ fn hotkey_thread_main(
                                 let err = unsafe { GetLastError() };
                                 if ll_enabled {
                                     if let Ok(mut list) = LL_HOOK_SPECS.lock() {
-                                        list.push((owner_key, spec, events_tx.clone()));
+                                        list.push((
+                                            owner_key,
+                                            spec,
+                                            events_tx.clone(),
+                                            Arc::clone(&notify_cb),
+                                        ));
                                     }
                                 }
                                 if err == ERROR_HOTKEY_ALREADY_REGISTERED {
@@ -526,7 +551,7 @@ fn hotkey_thread_main(
                             let mut removed_ll = false;
                             if let Ok(mut list) = LL_HOOK_SPECS.lock() {
                                 let before = list.len();
-                                list.retain(|(owner, s, _)| !(owner == &owner_key && s.id == id));
+                                list.retain(|(owner, s, _, _)| !(owner == &owner_key && s.id == id));
                                 removed_ll = list.len() < before;
                             }
                             let ok = unsafe { UnregisterHotKey(hwnd, id) } != 0;
@@ -544,7 +569,7 @@ fn hotkey_thread_main(
                     ll_hook = null_mut();
                 }
                 if let Ok(mut list) = LL_HOOK_SPECS.lock() {
-                    list.retain(|(owner, _, _)| *owner != owner_key);
+                    list.retain(|(owner, _, _, _)| *owner != owner_key);
                 }
                 for id in active_ids.drain() {
                     unsafe {
@@ -603,8 +628,10 @@ unsafe extern "system" fn ll_keyboard_proc(
             let alt = unsafe { ((GetAsyncKeyState(0x12) as u16) & 0x8000) != 0 };
             let shift = unsafe { ((GetAsyncKeyState(0x10) as u16) & 0x8000) != 0 };
 
+            let mut fire_cb: Option<Arc<dyn Fn() + Send + Sync>> = None;
+            let mut matched = false;
             if let Ok(list) = LL_HOOK_SPECS.lock() {
-                for (_, spec, tx) in list.iter() {
+                for (_, spec, tx, hook_cb) in list.iter() {
                     if spec.vk == vk {
                         let bits = spec.modifiers.bits();
                         let want_ctrl = (bits & MOD_CONTROL) != 0;
@@ -612,10 +639,18 @@ unsafe extern "system" fn ll_keyboard_proc(
                         let want_shift = (bits & MOD_SHIFT) != 0;
                         if ctrl == want_ctrl && alt == want_alt && shift == want_shift {
                             let _ = tx.send(HotkeyEvent { id: spec.id });
-                            return 1; // Swallow key so OS Snipping Tool doesn't hijack Print Screen!
+                            fire_cb = hook_cb.lock().ok().and_then(|g| g.clone());
+                            matched = true;
+                            break;
                         }
                     }
                 }
+            }
+            if matched {
+                if let Some(cb) = fire_cb {
+                    cb();
+                }
+                return 1; // Swallow key so OS Snipping Tool doesn't hijack Print Screen!
             }
         }
     }
