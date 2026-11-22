@@ -1,12 +1,14 @@
 //! Tiered Single-Process Daemon coordinator (`AppCoordinator`).
 //!
 //! - **Tier 0 (`--tray`)**: Lightweight Win32 tray icon + `snagsoup-win-platform` global
-//!   hotkey loop. Zero GPUI or Direct3D 11 allocation -> idle working set `< 12 MB`.
-//! - **Tier 1/2 (On-Demand)**: Pressing `PrintScreen` / `Ctrl+Shift+S` or clicking Tray menu
-//!   items spawns a fresh child `snagsoup.exe --capture-now` / `--capture` / `--editor` so the
-//!   Tier 0 `--tray` daemon remains permanently alive at `< 12 MB` RAM and 100% of GPU/Editor
-//!   memory is reclaimed by the OS the instant the child window closes!
+//!   hotkey loop (`< 12 MB` idle working set, zero GPUI or Direct3D 11 allocation).
+//! - **In-Process GPUI Transition**: Under strict GUID Single-Instance enforcement,
+//!   pressing a global hotkey, double-clicking the Tray icon, choosing `Restore` /
+//!   `Open Editor` / `Capture Now`, or launching a second copy of SnagSoup (even from
+//!   a renamed `.exe`) cleanly tears down the temporary Tier 0 loop and transitions
+//!   **in-process** into the GPUI shell while holding the exact same OS GUID Mutex.
 
+use std::cell::RefCell;
 use std::ptr::{null, null_mut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,6 +17,7 @@ use std::time::Duration;
 use snagsoup_ui::theme::ThemeMode;
 use snagsoup_win_platform::dpi;
 use snagsoup_win_platform::hotkey::{HotkeyAvailability, HotkeyManager, HotkeyModifiers, HotkeySpec};
+use snagsoup_win_platform::single_instance::{InstanceCommand, SingleInstanceGuard};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
@@ -37,6 +40,7 @@ const HOTKEY_CAPTURE_FALLBACK: i32 = 2;
 
 const WM_TRAY_ICON: u32 = WM_APP + 10;
 const WM_APP_HOTKEY_CAPTURE: u32 = WM_APP + 11;
+const WM_APP_IPC_WAKE: u32 = WM_APP + 12;
 const TRAY_ICON_ID: u32 = 1;
 
 const CMD_CAPTURE_NOW: u32 = 1000;
@@ -44,6 +48,10 @@ const CMD_OPEN_CAPTURE_WIN: u32 = 1001;
 const CMD_OPEN_EDITOR: u32 = 1002;
 const CMD_TRIM_MEMORY: u32 = 1003;
 const CMD_EXIT: u32 = 1004;
+
+thread_local! {
+    static TRAY_TRANSITION_CMD: RefCell<Option<InstanceCommand>> = const { RefCell::new(None) };
+}
 
 /// Central lifecycle coordinator for SnagSoup.
 pub struct AppCoordinator {
@@ -153,8 +161,9 @@ impl AppCoordinator {
     }
 
     /// Tier 0 Tray Daemon (`--tray`): sits in a lightweight Win32 tray loop
-    /// without initializing GPUI until the user triggers a capture or opens the Editor.
-    pub fn run_tray_daemon(&self) -> Result<(), String> {
+    /// without initializing GPUI until the user triggers a capture, opens a window,
+    /// or launches a second SnagSoup instance — then transitions in-process to GPUI.
+    pub fn run_tray_daemon(&self, guard: Arc<SingleInstanceGuard>) -> Result<(), String> {
         // Check for any unfinished crash-safe recordings on startup
         if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
             let recovery_dir = std::path::PathBuf::from(local_app_data)
@@ -176,15 +185,27 @@ impl AppCoordinator {
             );
         }
 
-        run_win32_tray_loop(hotkeys)?;
-        let _ = reclaim_process_memory();
+        let transition = run_win32_tray_loop(hotkeys, guard)?;
+        if let Some(cmd) = transition {
+            match cmd {
+                InstanceCommand::ActivateCaptureWindow => self.run_capture_window(),
+                InstanceCommand::OpenEditor(file) => self.run_editor(file),
+                InstanceCommand::CaptureNow => self.run_instant_capture(),
+                InstanceCommand::ActivateOneClick => self.run_oneclick_window(),
+            }
+        } else {
+            let _ = reclaim_process_memory();
+        }
         Ok(())
     }
 }
 
-fn spawn_self_with_flag(flag: &str) {
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = std::process::Command::new(exe).arg(flag).spawn();
+fn request_tray_transition(cmd: InstanceCommand) {
+    TRAY_TRANSITION_CMD.with(|cell| {
+        *cell.borrow_mut() = Some(cmd);
+    });
+    unsafe {
+        PostQuitMessage(0);
     }
 }
 
@@ -192,7 +213,14 @@ fn to_wide_null(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-fn run_win32_tray_loop(hotkeys: HotkeyManager) -> Result<(), String> {
+fn run_win32_tray_loop(
+    hotkeys: HotkeyManager,
+    guard: Arc<SingleInstanceGuard>,
+) -> Result<Option<InstanceCommand>, String> {
+    TRAY_TRANSITION_CMD.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
+
     let class_name = to_wide_null("SnagSoupTrayWindowClass");
     let window_title = to_wide_null("SnagSoup Tray");
 
@@ -242,9 +270,11 @@ fn run_win32_tray_loop(hotkeys: HotkeyManager) -> Result<(), String> {
             return Err("failed to create Win32 tray host window".to_string());
         }
 
-        // Spawn lightweight hotkey-bridge thread posting WM_APP_HOTKEY_CAPTURE to tray hwnd
+        // Spawn lightweight hotkey + single-instance IPC bridge thread
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_bg = Arc::clone(&stop_flag);
+        let guard_bg = Arc::clone(&guard);
+        let (ipc_tx, ipc_rx) = std::sync::mpsc::channel::<InstanceCommand>();
         let hwnd_raw = hwnd as isize;
         let hk_thread = std::thread::Builder::new()
             .name("snagsoup-tray-hotkey-bridge".into())
@@ -252,6 +282,12 @@ fn run_win32_tray_loop(hotkeys: HotkeyManager) -> Result<(), String> {
                 while !stop_bg.load(Ordering::Relaxed) {
                     if let Some(_ev) = hotkeys.try_recv_event() {
                         PostMessageW(hwnd_raw as HWND, WM_APP_HOTKEY_CAPTURE, 0, 0);
+                        break;
+                    }
+                    if let Some(cmd) = guard_bg.try_recv() {
+                        let _ = ipc_tx.send(cmd);
+                        PostMessageW(hwnd_raw as HWND, WM_APP_IPC_WAKE, 0, 0);
+                        break;
                     }
                     std::thread::sleep(Duration::from_millis(25));
                 }
@@ -284,6 +320,12 @@ fn run_win32_tray_loop(hotkeys: HotkeyManager) -> Result<(), String> {
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+            if msg.message == WM_APP_IPC_WAKE {
+                if let Ok(cmd) = ipc_rx.try_recv() {
+                    request_tray_transition(cmd);
+                    break;
+                }
+            }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -297,7 +339,7 @@ fn run_win32_tray_loop(hotkeys: HotkeyManager) -> Result<(), String> {
         DestroyWindow(hwnd);
     }
 
-    Ok(())
+    Ok(TRAY_TRANSITION_CMD.with(|cell| cell.borrow_mut().take()))
 }
 
 unsafe extern "system" fn tray_wnd_proc(
@@ -308,13 +350,13 @@ unsafe extern "system" fn tray_wnd_proc(
 ) -> LRESULT {
     match msg {
         WM_APP_HOTKEY_CAPTURE => {
-            spawn_self_with_flag("--capture-now");
+            request_tray_transition(InstanceCommand::CaptureNow);
             0
         }
         WM_TRAY_ICON => {
             let event = (lparam & 0xFFFF) as u32;
             if event == WM_LBUTTONDBLCLK {
-                spawn_self_with_flag("--capture");
+                request_tray_transition(InstanceCommand::ActivateCaptureWindow);
                 return 0;
             }
             if event == WM_RBUTTONUP || event == WM_CONTEXTMENU {
@@ -352,9 +394,15 @@ unsafe extern "system" fn tray_wnd_proc(
                         DestroyMenu(menu);
 
                         match cmd {
-                            CMD_CAPTURE_NOW => spawn_self_with_flag("--capture-now"),
-                            CMD_OPEN_CAPTURE_WIN => spawn_self_with_flag("--capture"),
-                            CMD_OPEN_EDITOR => spawn_self_with_flag("--editor"),
+                            CMD_CAPTURE_NOW => {
+                                request_tray_transition(InstanceCommand::CaptureNow);
+                            }
+                            CMD_OPEN_CAPTURE_WIN => {
+                                request_tray_transition(InstanceCommand::ActivateCaptureWindow);
+                            }
+                            CMD_OPEN_EDITOR => {
+                                request_tray_transition(InstanceCommand::OpenEditor(None));
+                            }
                             CMD_TRIM_MEMORY => {
                                 let _ = reclaim_process_memory();
                             }

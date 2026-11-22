@@ -26,10 +26,10 @@ use gpui::{
 };
 
 /// 4-component build version string (`x.x.x.x`).
-pub const APP_VERSION_FULL: &str = "1.1.0.0";
+pub const APP_VERSION_FULL: &str = "1.2.0.0";
 
 /// Canonical application window title (`SnagSoup vx.x.x.x`).
-pub const APP_TITLE: &str = "SnagSoup v1.1.0.0";
+pub const APP_TITLE: &str = "SnagSoup v1.2.0.0";
 
 /// Standard native Windows 11 titlebar configuration displaying `[Emerald S Icon] SnagSoup v1.0.0.0`.
 pub fn default_titlebar_options() -> TitlebarOptions {
@@ -103,6 +103,8 @@ thread_local! {
     static LAST_CAPTURE_RECT: RefCell<Option<RectF>> = const { RefCell::new(None) };
     static LIVE_HOTKEY_MGR: RefCell<Option<Arc<snagsoup_win_platform::hotkey::HotkeyManager>>> = const { RefCell::new(None) };
     static LIVE_TRAY_ICON: RefCell<Option<Arc<snagsoup_win_platform::tray::TrayIcon>>> = const { RefCell::new(None) };
+    static LIVE_INSTANCE_GUARD: RefCell<Option<Arc<snagsoup_win_platform::single_instance::SingleInstanceGuard>>> = const { RefCell::new(None) };
+    static SINGLE_INSTANCE_POLLING: Cell<bool> = const { Cell::new(false) };
     static APP_EXITING: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -112,10 +114,63 @@ const HK_ID_SHOW_HIDE_APP: i32 = 9003;
 const HK_ID_VIDEO_REC_PAUSE: i32 = 9004;
 const HK_ID_VIDEO_STOP: i32 = 9005;
 
+/// Register the session-wide GUID [`snagsoup_win_platform::single_instance::SingleInstanceGuard`]
+/// with the GPUI runtime so incoming secondary-launch commands (`WM_COPYDATA`) restore/focus
+/// the running window cleanly.
+pub fn register_single_instance_guard(
+    guard: Arc<snagsoup_win_platform::single_instance::SingleInstanceGuard>,
+) {
+    LIVE_INSTANCE_GUARD.with(|cell| {
+        *cell.borrow_mut() = Some(guard);
+    });
+}
+
+fn ensure_single_instance_ipc_listener(cx: &mut App) {
+    if SINGLE_INSTANCE_POLLING.with(|c| c.replace(true)) {
+        return;
+    }
+    let maybe_guard = LIVE_INSTANCE_GUARD.with(|cell| cell.borrow().clone());
+    let Some(poll_guard) = maybe_guard else {
+        SINGLE_INSTANCE_POLLING.with(|c| c.set(false));
+        return;
+    };
+
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(50))
+                .await;
+            if APP_EXITING.with(|c| c.get()) {
+                break;
+            }
+            while let Some(cmd) = poll_guard.try_recv() {
+                let _ = cx.update(|cx| {
+                    use snagsoup_win_platform::single_instance::InstanceCommand;
+                    match cmd {
+                        InstanceCommand::ActivateCaptureWindow | InstanceCommand::ActivateOneClick => {
+                            open_or_focus_capture_window(cx);
+                        }
+                        InstanceCommand::OpenEditor(file) => {
+                            open_or_focus_editor_window(file, cx);
+                        }
+                        InstanceCommand::CaptureNow => {
+                            trigger_active_or_default_capture(cx);
+                        }
+                    }
+                });
+            }
+        }
+    })
+    .detach();
+}
+
 /// Cleanly exit SnagSoup, removing the System Tray icon and bypassing `close_to_tray` vetoes.
 pub fn quit_snagsoup_application(cx: &mut App) {
     APP_EXITING.with(|c| c.set(true));
     LIVE_TRAY_ICON.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
+    LIVE_INSTANCE_GUARD.with(|cell| {
         *cell.borrow_mut() = None;
     });
     cx.quit();
@@ -955,6 +1010,9 @@ pub fn run_editor_window(initial_mode: ThemeMode, initial_file: Option<PathBuf>)
             initial_mode
         };
         cx.set_global(SnagTheme::for_mode(mode));
+        ensure_single_instance_ipc_listener(cx);
+        ensure_live_tray_icon(cx);
+        sync_all_live_hotkeys(&prefs, cx);
         open_or_focus_editor_window(initial_file.clone(), cx);
     });
 }
@@ -972,6 +1030,7 @@ pub fn run_capture_window(initial_mode: ThemeMode) {
             initial_mode
         };
         cx.set_global(SnagTheme::for_mode(mode));
+        ensure_single_instance_ipc_listener(cx);
         open_or_focus_capture_window(cx);
     });
 }
@@ -982,7 +1041,11 @@ pub fn run_oneclick_window(initial_mode: ThemeMode) {
         .name("snagsoup-wgc-prewarm".into())
         .spawn(|| snagsoup_capture::prewarm_wgc_monitor_sessions());
     create_application().run(move |cx: &mut App| {
+        let prefs = CapturePreferences::load_or_default();
         cx.set_global(SnagTheme::for_mode(initial_mode));
+        ensure_single_instance_ipc_listener(cx);
+        ensure_live_tray_icon(cx);
+        sync_all_live_hotkeys(&prefs, cx);
         let bounds = Bounds::centered(None, size(px(260.0), px(56.0)), cx);
         let _ = cx.open_window(
             WindowOptions {
@@ -998,23 +1061,7 @@ pub fn run_oneclick_window(initial_mode: ThemeMode) {
                             trigger_capture_preset_from_window(&CapturePreset::default(), hwnd, cx);
                         })
                         .with_on_open_editor(|_window, cx| {
-                            let ed_bounds =
-                                Bounds::centered(None, size(px(1240.0), px(780.0)), cx);
-                            let _ = cx.open_window(
-                                WindowOptions {
-                                    window_bounds: Some(WindowBounds::Windowed(ed_bounds)),
-                                    titlebar: Some(default_titlebar_options()),
-                                    ..Default::default()
-                                },
-                                |window, cx| {
-                                    window.activate_window();
-                                    if let Some(hwnd) = snagsoup_ui_huds::extract_hwnd(window) {
-                                        let _ = snagsoup_ui_huds::restore_and_focus_hwnd(hwnd);
-                                    }
-                                    cx.new(|_| EditorShellView::new(None))
-                                },
-                            );
-                            cx.activate(true);
+                            open_or_focus_editor_window(None, cx);
                         })
                 })
             },
@@ -1027,7 +1074,16 @@ pub fn run_oneclick_window(initial_mode: ThemeMode) {
 /// captured image in the GPUI Editor upon completion (`--capture-now` from `--tray` hotkey).
 pub fn run_instant_capture_flow(initial_mode: ThemeMode) {
     create_application().run(move |cx: &mut App| {
-        cx.set_global(SnagTheme::for_mode(initial_mode));
+        let prefs = CapturePreferences::load_or_default();
+        let mode = if prefs.dark_theme {
+            ThemeMode::Dark
+        } else {
+            initial_mode
+        };
+        cx.set_global(SnagTheme::for_mode(mode));
+        ensure_single_instance_ipc_listener(cx);
+        ensure_live_tray_icon(cx);
+        sync_all_live_hotkeys(&prefs, cx);
         trigger_capture_preset(&CapturePreset::default(), cx);
     });
 }
@@ -1051,10 +1107,10 @@ mod tests {
 
     #[test]
     fn app_title_and_titlebar_options_format() {
-        assert_eq!(APP_VERSION_FULL, "1.1.0.0");
-        assert_eq!(APP_TITLE, "SnagSoup v1.1.0.0");
+        assert_eq!(APP_VERSION_FULL, "1.2.0.0");
+        assert_eq!(APP_TITLE, "SnagSoup v1.2.0.0");
         let tb = default_titlebar_options();
         assert!(!tb.appears_transparent);
-        assert_eq!(tb.title.as_deref(), Some("SnagSoup v1.1.0.0"));
+        assert_eq!(tb.title.as_deref(), Some("SnagSoup v1.2.0.0"));
     }
 }

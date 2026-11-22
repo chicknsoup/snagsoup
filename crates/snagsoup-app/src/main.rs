@@ -4,14 +4,10 @@
 //! opens no console window, while CLI flags (`--check-mem`, `--help`, `--version`) attach
 //! cleanly to the parent console when invoked from a terminal.
 //!
-//! Supported CLI modes:
-//! - (default): Opens the GPUI Editor window
-//! - `--tray`: Starts lightweight Tier 0 Win32 tray + hotkey daemon (`< 14 MB` RAM) + crash recovery check
-//! - `--editor [path.snagx]`: Opens the GPUI Editor shell window directly
-//! - `--capture`: Opens the 3-tab GPUI Capture window
-//! - `--oneclick`: Opens the OneClick top-edge floating capture widget
-//! - `--scroll-helper <hwnd> <dy>`: Elevated scroll-wheel pulse helper for Admin windows
-//! - `--check-mem`: Initializes Tier 0 daemon, reports Working Set & Private Usage via `K32GetProcessMemoryInfo`, and exits
+//! Enforces strict session-wide single-instance execution via [`APP_INSTANCE_GUID`]
+//! (`Local\SnagSoup_Instance_<GUID>`). Even if `snagsoup.exe` is renamed or copied to
+//! another folder, launching a second copy forwards its activation command to the running
+//! instance via `WM_COPYDATA` and exits cleanly.
 
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
@@ -19,8 +15,12 @@ mod daemon;
 mod memory;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use snagsoup_ui::theme::ThemeMode;
+use snagsoup_win_platform::single_instance::{
+    AcquireOutcome, InstanceCommand, SingleInstanceGuard, notify_existing_instance,
+};
 
 use crate::daemon::AppCoordinator;
 
@@ -35,6 +35,20 @@ enum LaunchMode {
     CheckMem,
     Version,
     Help,
+}
+
+impl LaunchMode {
+    /// Convert an interactive launch mode into the IPC activation command forwarded
+    /// when a primary SnagSoup instance is already running.
+    fn to_instance_command(&self) -> Option<InstanceCommand> {
+        match self {
+            Self::Capture | Self::Tray => Some(InstanceCommand::ActivateCaptureWindow),
+            Self::Editor(file) => Some(InstanceCommand::OpenEditor(file.clone())),
+            Self::CaptureNow => Some(InstanceCommand::CaptureNow),
+            Self::OneClick => Some(InstanceCommand::ActivateOneClick),
+            Self::ScrollHelper { .. } | Self::CheckMem | Self::Version | Self::Help => None,
+        }
+    }
 }
 
 fn attach_parent_console_if_available() {
@@ -119,14 +133,17 @@ fn main() {
     let (mode, theme) = parse_args();
     let coordinator = AppCoordinator::new(theme);
 
-    match mode {
+    // Ephemeral CLI / helper commands bypass the GUI single-instance lock
+    match &mode {
         LaunchMode::Help => {
             attach_parent_console_if_available();
             print_help();
+            return;
         }
         LaunchMode::Version => {
             attach_parent_console_if_available();
             println!("{}", snagsoup_ui::APP_TITLE);
+            return;
         }
         LaunchMode::CheckMem => {
             attach_parent_console_if_available();
@@ -134,11 +151,35 @@ fn main() {
                 eprintln!("Error: {err}");
                 std::process::exit(1);
             }
+            return;
         }
         LaunchMode::ScrollHelper { hwnd, dy } => {
-            let _ = snagsoup_win_platform::scroll::send_scroll_wheel(dy, 0);
+            let _ = snagsoup_win_platform::scroll::send_scroll_wheel(*dy, 0);
             let _ = hwnd;
+            return;
         }
+        _ => {}
+    }
+
+    // Enforce session-wide single instance via fixed Application GUID
+    let instance_guard = match SingleInstanceGuard::try_acquire() {
+        Ok(AcquireOutcome::Primary(guard)) => Arc::new(guard),
+        Ok(AcquireOutcome::AlreadyRunning) => {
+            if let Some(cmd) = mode.to_instance_command() {
+                let _ = notify_existing_instance(&cmd);
+            }
+            return;
+        }
+        Err(err) => {
+            attach_parent_console_if_available();
+            eprintln!("Single-instance initialization warning: {err}");
+            return;
+        }
+    };
+
+    snagsoup_ui::register_single_instance_guard(Arc::clone(&instance_guard));
+
+    match mode {
         LaunchMode::Editor(file) => {
             coordinator.run_editor(file);
         }
@@ -152,11 +193,46 @@ fn main() {
             coordinator.run_oneclick_window();
         }
         LaunchMode::Tray => {
-            if let Err(err) = coordinator.run_tray_daemon() {
+            if let Err(err) = coordinator.run_tray_daemon(instance_guard) {
                 attach_parent_console_if_available();
                 eprintln!("Error: {err}");
                 std::process::exit(1);
             }
         }
+        LaunchMode::Help
+        | LaunchMode::Version
+        | LaunchMode::CheckMem
+        | LaunchMode::ScrollHelper { .. } => unreachable!(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launch_mode_maps_to_expected_single_instance_ipc_commands() {
+        assert_eq!(
+            LaunchMode::Capture.to_instance_command(),
+            Some(InstanceCommand::ActivateCaptureWindow)
+        );
+        assert_eq!(
+            LaunchMode::Tray.to_instance_command(),
+            Some(InstanceCommand::ActivateCaptureWindow)
+        );
+        assert_eq!(
+            LaunchMode::CaptureNow.to_instance_command(),
+            Some(InstanceCommand::CaptureNow)
+        );
+        let p = PathBuf::from("demo.snagx");
+        assert_eq!(
+            LaunchMode::Editor(Some(p.clone())).to_instance_command(),
+            Some(InstanceCommand::OpenEditor(Some(p)))
+        );
+        assert_eq!(LaunchMode::Version.to_instance_command(), None);
+        assert_eq!(
+            LaunchMode::ScrollHelper { hwnd: 1, dy: -120 }.to_instance_command(),
+            None
+        );
     }
 }

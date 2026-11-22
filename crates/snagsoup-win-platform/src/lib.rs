@@ -11,6 +11,7 @@ pub mod memory;
 pub mod object_finder;
 pub mod office_com;
 pub mod scroll;
+pub mod single_instance;
 pub mod startup;
 pub mod tray;
 
