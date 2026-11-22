@@ -277,7 +277,7 @@ fn capture_single_monitor_bgra_fast(monitor: &MonitorInfo) -> Result<CapturedFra
     let expected_h = bounds.height() as u32;
     let mut fallback_black: Option<CapturedFrame> = None;
 
-    if let Ok(frame) = wgc::capture_monitor_wgc_bgra_timeout(monitor.hmonitor, bounds, false, 85) {
+    if let Ok(frame) = wgc::capture_monitor_wgc_bgra_timeout(monitor.hmonitor, bounds, false, 160) {
         if frame.width == expected_w && frame.height == expected_h {
             if !is_frame_all_black(&frame.rgba) {
                 return Ok(frame);
@@ -447,5 +447,167 @@ mod tests {
             gdi::capture_rect_gdi(PhysicalRect::new(10, 20, 5, 10)).unwrap_err(),
             CaptureError::InvalidBounds
         );
+    }
+
+    #[test]
+    fn prewarm_before_new_window_still_freezes_newly_opened_window_on_first_capture() {
+        use std::ptr::{null, null_mut};
+        use std::time::Duration;
+        use windows_sys::Win32::Foundation::RECT;
+        use windows_sys::Win32::Graphics::Gdi::{
+            CreateSolidBrush, DeleteObject, FillRect, GdiFlush, GetDC, ReleaseDC, UpdateWindow,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, DispatchMessageW, GetWindowRect, PM_REMOVE,
+            PeekMessageW, RegisterClassW, SW_SHOWNOACTIVATE, ShowWindow, TranslateMessage,
+            WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+        };
+
+        let _ = init_per_monitor_dpi_v2();
+        // 1. Simulate app startup prewarm BEFORE the SnagSoup Capture Window opens
+        crate::prewarm_wgc_monitor_sessions();
+        std::thread::sleep(Duration::from_millis(60));
+
+        let Ok(topo) = enumerate_monitors() else {
+            return;
+        };
+        let Some(primary) = topo.monitors.iter().find(|m| m.is_primary) else {
+            return;
+        };
+
+        // 2. Open a bright magenta (R=244, G=12, B=212 -> COLORREF 0x00D40CF4) topmost popup window
+        let win_x = primary.physical_rect.left + 120;
+        let win_y = primary.physical_rect.top + 120;
+        let win_w = 160;
+        let win_h = 160;
+        let cls_name: Vec<u16> = "SnagSoupFreshFreezeProbeCls\0".encode_utf16().collect();
+
+        unsafe extern "system" fn probe_wnd_proc(
+            hwnd: windows_sys::Win32::Foundation::HWND,
+            msg: u32,
+            wparam: windows_sys::Win32::Foundation::WPARAM,
+            lparam: windows_sys::Win32::Foundation::LPARAM,
+        ) -> windows_sys::Win32::Foundation::LRESULT {
+            use windows_sys::Win32::Graphics::Gdi::{
+                BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, PAINTSTRUCT,
+            };
+            use windows_sys::Win32::UI::WindowsAndMessaging::{DefWindowProcW, WM_ERASEBKGND, WM_PAINT};
+            match msg {
+                WM_ERASEBKGND => 1,
+                WM_PAINT => unsafe {
+                    let mut ps: PAINTSTRUCT = std::mem::zeroed();
+                    let hdc = BeginPaint(hwnd, &mut ps);
+                    let br = CreateSolidBrush(0x00D4_0CF4);
+                    FillRect(hdc, &ps.rcPaint, br);
+                    DeleteObject(br);
+                    EndPaint(hwnd, &ps);
+                    0
+                },
+                _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+            }
+        }
+
+        unsafe {
+            let brush = CreateSolidBrush(0x00D4_0CF4);
+            let wc = WNDCLASSW {
+                style: 0,
+                lpfnWndProc: Some(probe_wnd_proc),
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: null_mut(),
+                hIcon: null_mut(),
+                hCursor: null_mut(),
+                hbrBackground: brush,
+                lpszMenuName: null(),
+                lpszClassName: cls_name.as_ptr(),
+            };
+            RegisterClassW(&wc);
+
+            let hwnd = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                cls_name.as_ptr(),
+                cls_name.as_ptr(),
+                WS_POPUP | WS_VISIBLE,
+                win_x,
+                win_y,
+                win_w,
+                win_h,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null(),
+            );
+            if hwnd.is_null() {
+                DeleteObject(brush);
+                return;
+            }
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            UpdateWindow(hwnd);
+            let hdc = GetDC(hwnd);
+            if !hdc.is_null() {
+                let fill_rc = RECT {
+                    left: 0,
+                    top: 0,
+                    right: win_w,
+                    bottom: win_h,
+                };
+                FillRect(hdc, &fill_rc, brush);
+                ReleaseDC(hwnd, hdc);
+            }
+            GdiFlush();
+            let mut msg = std::mem::zeroed();
+            while PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            let mut actual_rc: RECT = std::mem::zeroed();
+            GetWindowRect(hwnd, &mut actual_rc);
+
+            // Allow DWM 3 VSyncs (~65ms) to composite the newly opened window onto the monitor surface
+            std::thread::sleep(Duration::from_millis(75));
+
+            // 3. First-ever freeze MUST include the newly opened window (never a stale prewarm frame!)
+            let gdi_res = gdi::capture_rect_gdi(PhysicalRect::new(
+                actual_rc.left + 40,
+                actual_rc.top + 40,
+                actual_rc.left + 56,
+                actual_rc.top + 56,
+            ));
+            let mut freezer = ScreenFreezer::new();
+            let screens_res = freezer.freeze_all_monitors_bgra_parallel();
+            DestroyWindow(hwnd);
+            DeleteObject(brush);
+
+            let screens = screens_res.expect("first freeze after prewarm must succeed");
+            assert!(!screens.is_empty());
+
+            // Only assert test-HWND pixels when the test process runs on the interactive Default
+            // desktop (sandboxed CI/agent `HDESK` isolates child HWNDs and returns `AccessDenied` on GDI).
+            if let Ok(gdi_frame) = gdi_res {
+                if gdi_frame.rgba[0] > 200 && gdi_frame.rgba[2] > 170 {
+                    let target_cx = (actual_rc.left + actual_rc.right) / 2;
+                    let target_cy = (actual_rc.top + actual_rc.bottom) / 2;
+                    if let Some((mon, frozen)) = screens.iter().find(|(m, _)| {
+                        target_cx >= m.physical_rect.left
+                            && target_cx < m.physical_rect.right
+                            && target_cy >= m.physical_rect.top
+                            && target_cy < m.physical_rect.bottom
+                    }) {
+                        let cx = (target_cx - mon.physical_rect.left) as usize;
+                        let cy = (target_cy - mon.physical_rect.top) as usize;
+                        let w = frozen.frame.width as usize;
+                        let off = (cy * w + cx) * 4;
+                        let b = frozen.frame.rgba[off];
+                        let g = frozen.frame.rgba[off + 1];
+                        let r = frozen.frame.rgba[off + 2];
+                        assert!(
+                            r > 200 && g < 60 && b > 170,
+                            "First freeze missed newly opened window at ({target_cx},{target_cy}) on {}! Expected magenta (~244,12,212), got RGB=({r},{g},{b})",
+                            mon.device_name
+                        );
+                    }
+                }
+            }
+        }
     }
 }

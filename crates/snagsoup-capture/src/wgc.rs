@@ -6,7 +6,6 @@
 
 use crate::{CaptureBackend, CaptureError, CapturedFrame};
 use snagsoup_win_platform::dpi::PhysicalRect;
-use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -53,6 +52,8 @@ struct PooledWgcDevice {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     winrt_device: IDirect3DDevice,
+    staging: Option<ID3D11Texture2D>,
+    staging_desc: Option<(u32, u32, DXGI_FORMAT)>,
 }
 
 // SAFETY: `ID3D11Device` and `CreateDirect3D11DeviceFromDXGIDevice` agile WinRT wrappers are
@@ -118,6 +119,8 @@ fn create_pooled_wgc_device() -> Result<PooledWgcDevice, CaptureError> {
         device,
         context,
         winrt_device,
+        staging: None,
+        staging_desc: None,
     })
 }
 
@@ -162,12 +165,9 @@ pub struct WgcMonitorSession {
     session: GraphicsCaptureSession,
     frame_pool: Direct3D11CaptureFramePool,
     _item: GraphicsCaptureItem,
-    staging: Option<ID3D11Texture2D>,
-    staging_desc: Option<(u32, u32, DXGI_FORMAT)>,
     pooled_dev: Option<PooledWgcDevice>,
     frame_signal: Arc<(Mutex<u64>, Condvar)>,
     last_seen_seq: u64,
-    last_bgra: Option<(u32, u32, Vec<u8>)>,
     // MUST be the last field so `RoUninitialize()` runs AFTER all WinRT/COM objects drop!
     _ro_guard: RoGuard,
 }
@@ -279,12 +279,9 @@ impl WgcMonitorSession {
             session,
             frame_pool,
             _item: item,
-            staging: None,
-            staging_desc: None,
             pooled_dev: Some(dev),
             frame_signal,
             last_seen_seq: 0,
-            last_bgra: None,
             _ro_guard: ro_guard,
         })
     }
@@ -362,13 +359,13 @@ impl WgcMonitorSession {
             .map(|s| (s.Height.max(1) as u32).min(desc.Height))
             .unwrap_or(desc.Height);
 
-        let dev = self.pooled_dev.as_ref().ok_or(CaptureError::Dxgi {
+        let dev = self.pooled_dev.as_mut().ok_or(CaptureError::Dxgi {
             api: "WGC::pooled_dev",
             hresult: -1,
         })?;
 
         let key = (desc.Width, desc.Height, desc.Format);
-        if self.staging_desc != Some(key) {
+        if dev.staging_desc != Some(key) || dev.staging.is_none() {
             let mut staging_desc = desc;
             staging_desc.Usage = D3D11_USAGE_STAGING;
             staging_desc.BindFlags = 0;
@@ -386,11 +383,11 @@ impl WgcMonitorSession {
                 api: "WGC::CreateTexture2D(staging)",
                 hresult: e.code().0,
             })?;
-            self.staging = staging;
-            self.staging_desc = Some(key);
+            dev.staging = staging;
+            dev.staging_desc = Some(key);
         }
 
-        let staging = self.staging.as_ref().unwrap();
+        let staging = dev.staging.as_ref().unwrap();
         unsafe { dev.context.CopyResource(staging, &tex) };
 
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
@@ -436,10 +433,6 @@ impl WgcMonitorSession {
         unsafe { dev.context.Unmap(staging, 0) };
         let _ = frame.Close();
 
-        if !swizzle_to_rgba {
-            self.last_bgra = Some((copy_w, copy_h, out.clone()));
-        }
-
         Ok((copy_w, copy_h, out))
     }
 
@@ -460,7 +453,6 @@ impl Drop for WgcMonitorSession {
     fn drop(&mut self) {
         let _ = self.session.Close();
         let _ = self.frame_pool.Close();
-        self.staging = None;
         if let Some(dev) = self.pooled_dev.take() {
             checkin_wgc_device(dev);
         }
@@ -471,56 +463,19 @@ impl Drop for WgcMonitorSession {
 // MTA WinRT/D3D11 objects, and each session is checked out exclusively to a single thread at a time.
 unsafe impl Send for WgcMonitorSession {}
 
-static WARM_SESSION_POOL: OnceLock<Mutex<HashMap<(isize, bool), WgcMonitorSession>>> =
-    OnceLock::new();
-
-fn session_pool() -> &'static Mutex<HashMap<(isize, bool), WgcMonitorSession>> {
-    WARM_SESSION_POOL.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn checkout_warm_session(hmonitor: isize, capture_cursor: bool) -> Option<WgcMonitorSession> {
-    session_pool()
-        .lock()
-        .ok()
-        .and_then(|mut map| map.remove(&(hmonitor, capture_cursor)))
-}
-
-fn checkin_warm_session(hmonitor: isize, capture_cursor: bool, session: WgcMonitorSession) {
-    if let Ok(mut map) = session_pool().lock() {
-        if map.len() < 8 {
-            map.insert((hmonitor, capture_cursor), session);
-        }
-    }
-}
-
-/// Pre-warm persistent free-threaded WGC monitor sessions for all active monitors on a background
-/// thread so clicking `Capture` grabs the latest VRAM frame in **`< 15ms`** (`0ms` DWM session setup,
-/// `0ms` staging texture allocation)!
+/// Pre-warm reusable WGC `ID3D11Device` + `IDirect3DDevice` instances for all active monitors on a
+/// background thread (`0%` idle DWM load and **never** caches pre-window stale frames, while paying
+/// `0ms` D3D11 driver setup when the user clicks `Capture`).
 pub fn prewarm_wgc_monitor_sessions() {
-    let Ok(topo) = snagsoup_win_platform::dpi::enumerate_monitors() else {
-        return;
-    };
-    std::thread::scope(|s| {
-        for mon in &topo.monitors {
-            let hm = mon.hmonitor;
-            s.spawn(move || {
-                let already = session_pool()
-                    .lock()
-                    .ok()
-                    .is_some_and(|m| m.contains_key(&(hm, false)));
-                if !already {
-                    if let Ok(mut sess) = WgcMonitorSession::start(hm, false) {
-                        let _ = sess.acquire_frame_bgra(150);
-                        checkin_warm_session(hm, false, sess);
-                    }
-                }
-            });
-        }
-    });
+    let count = snagsoup_win_platform::dpi::enumerate_monitors()
+        .map(|t| t.monitors.len().clamp(1, 4))
+        .unwrap_or(2);
+    prewarm_wgc_device_pool(count);
 }
 
-/// Capture a single **BGRA8** frame of `hmonitor` using a persistent warm `WgcMonitorSession`
-/// (creating & caching one if not yet warm, or recreating transparently if display mode changed).
+/// Capture a single **live BGRA8** frame of `hmonitor` at the exact moment of invocation,
+/// reusing a pooled `ID3D11Device` and staging `ID3D11Texture2D` (`~12–22ms`, guaranteed never
+/// to return a stale frame from a previously saturated `Direct3D11CaptureFramePool`).
 pub fn capture_monitor_wgc_bgra_timeout(
     hmonitor: isize,
     bounds: PhysicalRect,
@@ -530,50 +485,9 @@ pub fn capture_monitor_wgc_bgra_timeout(
     if bounds.width() <= 0 || bounds.height() <= 0 || hmonitor == 0 {
         return Err(CaptureError::InvalidBounds);
     }
-    let expected_w = bounds.width() as u32;
-    let expected_h = bounds.height() as u32;
     let started = Instant::now();
-
-    if let Some(mut warm) = checkout_warm_session(hmonitor, capture_cursor) {
-        match warm.acquire_frame_bgra(18) {
-            Ok((width, height, bgra)) if width == expected_w && height == expected_h => {
-                checkin_warm_session(hmonitor, capture_cursor, warm);
-                return Ok(CapturedFrame {
-                    bounds,
-                    width,
-                    height,
-                    rgba: bgra,
-                    backend: CaptureBackend::WindowsGraphicsCapture,
-                    elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
-                });
-            }
-            Err(CaptureError::WaitTimeout) => {
-                // Static monitor: DWM only pushes frames when >= 1 pixel changes! Return the
-                // unchanged cached frame in <2ms and keep the warm session alive in the pool.
-                if let Some((cw, ch, ref cached)) = warm.last_bgra {
-                    if cw == expected_w && ch == expected_h {
-                        let bgra = cached.clone();
-                        checkin_warm_session(hmonitor, capture_cursor, warm);
-                        return Ok(CapturedFrame {
-                            bounds,
-                            width: cw,
-                            height: ch,
-                            rgba: bgra,
-                            backend: CaptureBackend::WindowsGraphicsCapture,
-                            elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
-                        });
-                    }
-                }
-            }
-            _ => {}
-        }
-        // Display resolution changed or session invalidated — drop stale session and recreate below
-        drop(warm);
-    }
-
     let mut fresh = WgcMonitorSession::start(hmonitor, capture_cursor)?;
     let (width, height, bgra) = fresh.acquire_frame_bgra(timeout_ms)?;
-    checkin_warm_session(hmonitor, capture_cursor, fresh);
     Ok(CapturedFrame {
         bounds,
         width,
