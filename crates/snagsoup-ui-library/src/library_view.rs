@@ -958,17 +958,27 @@ impl Render for LibraryOrganizerView {
                                     div()
                                         .text_sm()
                                         .font_weight(gpui::FontWeight::BOLD)
-                                        .child(format!(
-                                            "Xóa vĩnh viễn {selected_count} mục đã chọn?"
-                                        )),
+                                        .child(if selected_count == 1 {
+                                            "Permanently delete 1 selected item?".to_string()
+                                        } else {
+                                            format!(
+                                                "Permanently delete {selected_count} selected items?"
+                                            )
+                                        }),
                                 )
                                 .child(
                                     div()
                                         .text_xs()
                                         .text_color(rgb(0xCBD5E1))
-                                        .child(format!(
-                                            "Thao tác này sẽ xóa vĩnh viễn {selected_count} file khỏi Thư viện và ổ đĩa ({first_selected_name}). Không thể hoàn tác."
-                                        )),
+                                        .child(if selected_count == 1 {
+                                            format!(
+                                                "This will permanently remove \"{first_selected_name}\" from your Library and disk. This action cannot be undone."
+                                            )
+                                        } else {
+                                            format!(
+                                                "This will permanently remove {selected_count} files (including \"{first_selected_name}\") from your Library and disk. This action cannot be undone."
+                                            )
+                                        }),
                                 )
                                 .child(
                                     div()
@@ -992,7 +1002,7 @@ impl Render for LibraryOrganizerView {
                                                     this.cancel_delete_confirmation();
                                                     cx.notify();
                                                 }))
-                                                .child("Hủy (Cancel)"),
+                                                .child("Cancel"),
                                         )
                                         .child(
                                             div()
@@ -1014,7 +1024,7 @@ impl Render for LibraryOrganizerView {
                                                     }
                                                     cx.notify();
                                                 }))
-                                                .child("🗑 Xóa vĩnh viễn (Delete)"),
+                                                .child("🗑 Delete Permanently"),
                                         ),
                                 ),
                         ),

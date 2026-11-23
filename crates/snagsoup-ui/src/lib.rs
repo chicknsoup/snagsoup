@@ -26,10 +26,10 @@ use gpui::{
 };
 
 /// 4-component build version string (`x.x.x.x`).
-pub const APP_VERSION_FULL: &str = "1.4.1.5";
+pub const APP_VERSION_FULL: &str = "1.4.1.6";
 
 /// Canonical application window title (`SnagSoup vx.x.x.x`).
-pub const APP_TITLE: &str = "SnagSoup v1.4.1.5";
+pub const APP_TITLE: &str = "SnagSoup v1.4.1.6";
 
 /// Standard native Windows 11 titlebar configuration displaying `[Emerald S Icon] SnagSoup v1.0.0.0`.
 pub fn default_titlebar_options() -> TitlebarOptions {
@@ -1175,10 +1175,10 @@ mod tests {
 
     #[test]
     fn app_title_and_titlebar_options_format() {
-        assert_eq!(APP_VERSION_FULL, "1.4.1.5");
-        assert_eq!(APP_TITLE, "SnagSoup v1.4.1.5");
+        assert_eq!(APP_VERSION_FULL, "1.4.1.6");
+        assert_eq!(APP_TITLE, "SnagSoup v1.4.1.6");
         let tb = default_titlebar_options();
         assert!(!tb.appears_transparent);
-        assert_eq!(tb.title.as_deref(), Some("SnagSoup v1.4.1.5"));
+        assert_eq!(tb.title.as_deref(), Some("SnagSoup v1.4.1.6"));
     }
 }
