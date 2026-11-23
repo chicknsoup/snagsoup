@@ -1,8 +1,8 @@
 1 ICON "snagsoup.ico"
 
 1 VERSIONINFO
-FILEVERSION 1,4,1,4
-PRODUCTVERSION 1,4,1,4
+FILEVERSION 1,4,1,5
+PRODUCTVERSION 1,4,1,5
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0x0L
 FILEOS 0x40004L
@@ -15,12 +15,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "SnagSoup"
             VALUE "FileDescription", "SnagSoup Screen Capture & Editor"
-            VALUE "FileVersion", "1.4.1.4"
+            VALUE "FileVersion", "1.4.1.5"
             VALUE "InternalName", "snagsoup.exe"
             VALUE "LegalCopyright", "Copyright (c) SnagSoup"
             VALUE "OriginalFilename", "snagsoup.exe"
             VALUE "ProductName", "SnagSoup"
-            VALUE "ProductVersion", "1.4.1.4"
+            VALUE "ProductVersion", "1.4.1.5"
         END
     END
     BLOCK "VarFileInfo"

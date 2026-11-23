@@ -153,6 +153,21 @@ fn load_item_render_thumb(path: &Path, media_type: &MediaType) -> Option<Arc<Ren
     }
 }
 
+/// Format a clean single-line card title for a [`LibraryItem`] (preferring `window_title`,
+/// falling back to the file's basename rather than a sprawling multi-line disk path).
+pub fn display_item_title(item: &LibraryItem) -> String {
+    let wt = item.window_title.trim();
+    if !wt.is_empty() {
+        return wt.to_string();
+    }
+    Path::new(&item.file_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&item.file_path)
+        .to_string()
+}
+
 /// Full GPUI Library Organizer View (`W3-14`) wired to `snagsoup_library_export::LibraryDb`.
 pub struct LibraryOrganizerView {
     pub db: LibraryDb,
@@ -219,10 +234,21 @@ impl LibraryOrganizerView {
         self
     }
 
-    /// Scan `dir` (e.g. `%LOCALAPPDATA%\SnagSoup\Captures`) and index any `.snagx`, `.mp4`, or `.gif`
-    /// files on disk so saved captures are always visible in the Library.
+    /// Scan `dir` (e.g. `%LOCALAPPDATA%\SnagSoup\Captures`), prune stale database rows whose
+    /// underlying file no longer exists on disk, and index any `.snagx`, `.mp4`, or `.gif` files.
     pub fn sync_directory(&mut self, dir: &Path) -> usize {
+        // Prune orphaned entries (e.g. deleted files or cleaned-up temp test files)
+        if let Ok(existing) = self.db.list_recent(2000) {
+            for item in existing {
+                if !Path::new(&item.file_path).exists() {
+                    let _ = self.db.remove_by_path(&item.file_path);
+                    self.render_thumbs.remove(&item.file_path);
+                }
+            }
+        }
+
         let Ok(entries) = std::fs::read_dir(dir) else {
+            self.refresh();
             return 0;
         };
         let mut synced = 0usize;
@@ -315,7 +341,7 @@ impl LibraryOrganizerView {
         if let Some(cached) = self.render_thumbs.get(&item.file_path) {
             return cached.clone();
         }
-        if self.render_thumbs.len() >= 128 {
+        if self.render_thumbs.len() >= 256 {
             self.render_thumbs.clear();
         }
         let loaded = load_item_render_thumb(Path::new(&item.file_path), &item.media_type);
@@ -540,14 +566,25 @@ impl Render for LibraryOrganizerView {
         ];
 
         let mut sidebar = div()
+            .id("lib-sidebar-scroll")
             .w(px(220.0))
+            .flex_shrink_0()
+            .h_full()
+            .overflow_y_scroll()
             .bg(rgb(0x1E2128))
+            .border_r_1()
+            .border_color(rgb(0x2A303C))
             .p(px(12.0))
             .flex()
             .flex_col()
             .gap(px(6.0))
             .text_color(rgb(0xE2E8F0))
-            .child(div().text_sm().child("Library"));
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child("Library"),
+            );
 
         for (flt, fid, label) in filters {
             let active = &self.active_filter == flt;
@@ -593,14 +630,16 @@ impl Render for LibraryOrganizerView {
             );
         }
 
-        let visible_items: Vec<LibraryItem> = self.items[start..end].to_vec();
+        let visible_items: Vec<LibraryItem> = self.items.iter().take(200).cloned().collect();
+        let shown_end = visible_items.len().max(end);
         let on_open_cb = self.on_open_item.clone();
 
-        let mut grid = div()
-            .flex_1()
-            .p(px(16.0))
+        let mut grid_cards = div()
+            .w_full()
             .flex()
+            .flex_row()
             .flex_wrap()
+            .items_start()
             .gap(px(12.0));
 
         for item in visible_items {
@@ -617,10 +656,12 @@ impl Render for LibraryOrganizerView {
                 MediaType::Gif => "GIF",
                 MediaType::Image => "IMG",
             };
+            let card_title = display_item_title(&item);
 
-            grid = grid.child(
+            grid_cards = grid_cards.child(
                 div()
                     .id(SharedString::from(format!("lib-card-{item_id}")))
+                    .flex_shrink_0()
                     .w(px(208.0))
                     .h(px(184.0))
                     .p(px(8.0))
@@ -679,14 +720,11 @@ impl Render for LibraryOrganizerView {
                     )
                     .child(
                         div()
+                            .w_full()
                             .text_xs()
-                            .overflow_hidden()
+                            .truncate()
                             .text_color(rgb(0xF8FAFC))
-                            .child(if item.window_title.is_empty() {
-                                item.file_path.clone()
-                            } else {
-                                item.window_title.clone()
-                            }),
+                            .child(card_title),
                     )
                     .child(
                         div()
@@ -722,59 +760,90 @@ impl Render for LibraryOrganizerView {
             );
         }
 
+        let grid_scroll = div()
+            .id("lib-grid-scroll")
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .overflow_y_scroll()
+            .p(px(16.0))
+            .child(grid_cards);
+
         let selected_count = self.selected_ids.len();
         let show_confirm = self.confirm_delete_open && selected_count > 0;
         let first_selected_name = self
             .items
             .iter()
             .find(|i| self.selected_ids.contains(&i.id))
-            .map(|i| {
-                if i.window_title.is_empty() {
-                    i.file_path.clone()
-                } else {
-                    i.window_title.clone()
-                }
-            })
+            .map(display_item_title)
             .unwrap_or_default();
+        let header_summary = if self.status_message.trim().is_empty() {
+            format!("Library ({} items, showing {}..{})", self.items.len(), start, shown_end)
+        } else {
+            format!(
+                "Library ({} items, showing {}..{}) · {}",
+                self.items.len(),
+                start,
+                shown_end,
+                self.status_message
+            )
+        };
 
         div()
             .relative()
             .size_full()
+            .overflow_hidden()
             .flex()
             .bg(rgb(0x161920))
             .child(sidebar)
             .child(
                 div()
                     .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .h_full()
+                    .overflow_hidden()
                     .flex()
                     .flex_col()
                     .child(
                         div()
-                            .min_h(px(44.0))
+                            .flex_shrink_0()
+                            .w_full()
                             .px(px(16.0))
-                            .py(px(6.0))
+                            .py(px(10.0))
                             .bg(rgb(0x1B1F27))
+                            .border_b_1()
+                            .border_color(rgb(0x2A303C))
                             .flex()
+                            .flex_row()
                             .flex_wrap()
                             .items_center()
                             .justify_between()
-                            .gap(px(8.0))
+                            .gap(px(10.0))
                             .text_color(rgb(0xE2E8F0))
-                            .child(format!(
-                                "Library ({} items, showing {}..{}) · {}",
-                                self.items.len(),
-                                start,
-                                end,
-                                self.status_message
-                            ))
                             .child(
                                 div()
+                                    .flex_1()
+                                    .min_w(px(220.0))
+                                    .text_sm()
+                                    .truncate()
+                                    .child(header_summary),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
                                     .flex()
                                     .flex_row()
                                     .flex_wrap()
                                     .items_center()
                                     .gap(px(8.0))
-                                    .child(format!("Selected: {selected_count}"))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .whitespace_nowrap()
+                                            .text_color(rgb(0xCBD5E1))
+                                            .child(format!("Selected: {selected_count}")),
+                                    )
                                     .child(
                                         div()
                                             .id("lib-btn-refresh")
@@ -782,8 +851,10 @@ impl Render for LibraryOrganizerView {
                                             .py(px(4.0))
                                             .rounded(px(4.0))
                                             .bg(rgb(0x334155))
+                                            .hover(|s| s.bg(rgb(0x475569)))
                                             .cursor_pointer()
                                             .text_xs()
+                                            .whitespace_nowrap()
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.refresh();
                                                 this.status_message = "Refreshed".into();
@@ -798,8 +869,10 @@ impl Render for LibraryOrganizerView {
                                             .py(px(4.0))
                                             .rounded(px(4.0))
                                             .bg(rgb(0x2563EB))
+                                            .hover(|s| s.bg(rgb(0x3B82F6)))
                                             .cursor_pointer()
                                             .text_xs()
+                                            .whitespace_nowrap()
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.batch_apply_tags(&["starred".into()]);
                                                 cx.notify();
@@ -813,8 +886,10 @@ impl Render for LibraryOrganizerView {
                                             .py(px(4.0))
                                             .rounded(px(4.0))
                                             .bg(rgb(0x0D9488))
+                                            .hover(|s| s.bg(rgb(0x14B8A6)))
                                             .cursor_pointer()
                                             .text_xs()
+                                            .whitespace_nowrap()
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 let out_dir = std::env::var("LOCALAPPDATA")
                                                     .map(PathBuf::from)
@@ -843,6 +918,7 @@ impl Render for LibraryOrganizerView {
                                             .opacity(if selected_count > 0 { 1.0 } else { 0.55 })
                                             .cursor_pointer()
                                             .text_xs()
+                                            .whitespace_nowrap()
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 let _ = this.request_delete_selected();
                                                 cx.notify();
@@ -851,7 +927,7 @@ impl Render for LibraryOrganizerView {
                                     ),
                             ),
                     )
-                    .child(grid),
+                    .child(grid_scroll),
             )
             // Centered Delete Confirmation Modal
             .when(show_confirm, |root| {

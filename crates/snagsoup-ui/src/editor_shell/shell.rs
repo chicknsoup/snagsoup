@@ -1631,13 +1631,15 @@ impl EditorShellState {
         self.active_path = Some(path.to_path_buf());
         self.status_message = format!("Saved {}", path.display());
 
-        // Always index saved .snagx into persistent SQLite FTS5 LibraryDb immediately!
-        let db_path = library_db_path();
-        if let Some(parent) = db_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(mut db) = LibraryDb::open_file(&db_path) {
-            let _ = db.index_snagx_file(path);
+        // Index saved .snagx into persistent SQLite FTS5 LibraryDb (excluding scratch %TEMP% files)
+        if !path.starts_with(std::env::temp_dir()) {
+            let db_path = library_db_path();
+            if let Some(parent) = db_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(mut db) = LibraryDb::open_file(&db_path) {
+                let _ = db.index_snagx_file(path);
+            }
         }
         let dims = (self.session.bitmap.width(), self.session.bitmap.height());
         let title = path

@@ -11,6 +11,7 @@ pub mod xliff_view;
 pub use combine_view::CombineImagesView;
 pub use library_view::{
     LibraryFilter, LibraryOrganizerView, ThumbnailLruCache, compute_visible_grid_range,
+    display_item_title,
 };
 pub use share_menu::{ShareMenuView, ShareTargetKind};
 pub use template_view::TemplateBuilderView;
@@ -91,6 +92,33 @@ mod tests {
         assert_eq!(view.batch_apply_tags(&["docs".into(), "rust".into()]), 1);
         view.set_filter(LibraryFilter::Videos);
         assert_eq!(view.items.len(), 1);
+
+        // Clean card display title falls back to basename when window_title is empty
+        let untitled = LibraryItem {
+            id: 99,
+            file_path: r"C:\Users\demo\AppData\Local\SnagSoup\Captures\SnagSoup_179533.snagx".into(),
+            media_type: MediaType::Image,
+            capture_date: String::new(),
+            app_name: "SnagSoup".into(),
+            window_title: String::new(),
+            web_url: String::new(),
+            callout_text: String::new(),
+            ocr_text: String::new(),
+            width: 800,
+            height: 600,
+            tags: vec![],
+        };
+        assert_eq!(display_item_title(&untitled), "SnagSoup_179533.snagx");
+
+        // `sync_directory` prunes orphaned rows whose physical files were deleted
+        view.set_filter(LibraryFilter::Recent);
+        assert_eq!(view.items.len(), 2);
+        let empty_dir = std::env::temp_dir().join("snagsoup_lib_sync_prune_test");
+        let _ = std::fs::remove_dir_all(&empty_dir);
+        std::fs::create_dir_all(&empty_dir).unwrap();
+        view.sync_directory(&empty_dir);
+        assert_eq!(view.items.len(), 0, "orphaned missing files must be pruned on sync_directory");
+        let _ = std::fs::remove_dir_all(&empty_dir);
     }
 
     #[test]
