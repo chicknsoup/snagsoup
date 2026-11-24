@@ -10,10 +10,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
     AppContext, Bounds, Context, CursorStyle, ElementInputHandler, Entity, EntityInputHandler,
-    FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, Pixels, Point, Render, RenderImage,
-    ScrollDelta, ScrollEvent, SharedString, StatefulInteractiveElement, Styled, StyledImage,
-    UTF16Selection, Window, canvas, div, img, prelude::FluentBuilder, px, rgb, rgba,
+    FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, KeyUpEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, Pixels, Point, Render,
+    RenderImage, ScrollDelta, ScrollEvent, SharedString, StatefulInteractiveElement, Styled,
+    StyledImage, UTF16Selection, Window, canvas, div, img, prelude::FluentBuilder, px, rgb, rgba,
 };
 use snagsoup_canvas::{
     CutOutOrientation, DocumentSession, HistoryCommand, PixelRect, SceneCompositor, TiledBitmap,
@@ -581,7 +581,7 @@ impl EditorShellState {
             }
             ToolMode::Move | ToolMode::SmartMove => {
                 self.status_message =
-                    "Move: drag annotations, or toggle Smart Move ON in Properties to move UI buttons".into();
+                    "Move: drag image to pan, drag annotations to move, or toggle Smart Move ON".into();
             }
             ToolMode::Simplify => {
                 self.status_message =
@@ -818,6 +818,10 @@ impl EditorShellState {
                         before_objects,
                         smart_move_lift,
                     });
+                } else {
+                    self.active_drag = Some(CanvasDragOp::Pan {
+                        last_screen: (local_x, local_y),
+                    });
                 }
             }
             ToolMode::Shape => {
@@ -1034,6 +1038,9 @@ impl EditorShellState {
             CanvasDragOp::Pan { last_screen } => {
                 self.viewport
                     .pan_by(local_x - last_screen.0, local_y - last_screen.1);
+                let cw = self.session.bitmap.width();
+                let ch = self.session.bitmap.height();
+                self.viewport.clamp_pan_to_canvas(cw, ch, false);
                 self.active_drag = Some(CanvasDragOp::Pan {
                     last_screen: (local_x, local_y),
                 });
@@ -1449,10 +1456,18 @@ impl EditorShellState {
         self.status_message = format!("Copied {w}×{h} px selection to Clipboard");
         Ok(())
     }
-    /// Clamp zoom to Snagit's `10% – 800%` range.
+    /// Clamp zoom to Snagit's `10% – 800%` range, anchored at the viewport center
+    /// and clamped so zoomed-out canvases stay cleanly framed in view.
     pub fn set_zoom(&mut self, percent: f32) {
-        self.zoom_percent = percent.clamp(10.0, 800.0);
-        self.viewport.zoom = self.zoom_percent / 100.0;
+        let clamped_pct = percent.clamp(10.0, 800.0);
+        let next_scale = clamped_pct / 100.0;
+        let cx_x = self.viewport.viewport_w * 0.5;
+        let cy_y = self.viewport.viewport_h * 0.5;
+        self.viewport.zoom_anchored_at(next_scale, cx_x, cy_y);
+        let cw = self.session.bitmap.width();
+        let ch = self.session.bitmap.height();
+        self.viewport.clamp_pan_to_canvas(cw, ch, true);
+        self.zoom_percent = clamped_pct;
     }
 
     /// Reorder a tool in the customizable top toolbar.
@@ -2024,6 +2039,9 @@ pub struct EditorShellView {
     create_btn_bounds: Rc<Cell<(f32, f32, f32)>>,
     more_btn_bounds: Rc<Cell<(f32, f32, f32)>>,
     share_btn_bounds: Rc<Cell<(f32, f32, f32)>>,
+    zoom_anim_target: Option<(f32, f32, f32)>,
+    zoom_anim_running: bool,
+    zoom_settle_seq: u64,
     library_view: Option<Entity<LibraryOrganizerView>>,
     template_view: Option<Entity<TemplateBuilderView>>,
     combine_view: Option<Entity<CombineImagesView>>,
@@ -2191,12 +2209,113 @@ impl EditorShellView {
             create_btn_bounds: Rc::new(Cell::new((350.0, 38.0, 80.0))),
             more_btn_bounds: Rc::new(Cell::new((640.0, 38.0, 68.0))),
             share_btn_bounds: Rc::new(Cell::new((1180.0, 38.0, 76.0))),
+            zoom_anim_target: None,
+            zoom_anim_running: false,
+            zoom_settle_seq: 0,
             library_view: None,
             template_view: None,
             combine_view: None,
             vfi_view: None,
             xliff_view: None,
         }
+    }
+
+    /// Zero-latency interactive zoom (for slider dragging & precision trackpad scroll)
+    /// using GPU quad scaling while active, settling to crisp vector/Fant quality `90 ms` after motion stops.
+    fn apply_direct_interactive_zoom(
+        &mut self,
+        target_scale: f32,
+        anchor_x: f32,
+        anchor_y: f32,
+        cx: &mut Context<Self>,
+    ) {
+        self.zoom_anim_target = None;
+        let clamped = target_scale.clamp(0.10, 8.00);
+        self.state.gpu_cache.interactive_zoom_active = true;
+        self.state
+            .viewport
+            .zoom_anchored_at(clamped, anchor_x, anchor_y);
+        let cw = self.state.session.bitmap.width();
+        let ch = self.state.session.bitmap.height();
+        self.state.viewport.clamp_pan_to_canvas(cw, ch, true);
+        self.state.zoom_percent = self.state.viewport.zoom_percent();
+
+        self.zoom_settle_seq = self.zoom_settle_seq.wrapping_add(1);
+        let seq = self.zoom_settle_seq;
+        cx.spawn(async move |weak, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(90))
+                .await;
+            let _ = weak.update(cx, |view, cx| {
+                if view.zoom_settle_seq == seq && !view.zoom_anim_running {
+                    view.state.gpu_cache.interactive_zoom_active = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Smooth exponential ease-out zoom animation (`Ctrl + Mouse Wheel` notches & `-` / `+` / `100%` buttons).
+    fn animate_zoom_towards(
+        &mut self,
+        target_scale: f32,
+        anchor_x: f32,
+        anchor_y: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let clamped = target_scale.clamp(0.10, 8.00);
+        self.zoom_anim_target = Some((clamped, anchor_x, anchor_y));
+        self.state.gpu_cache.interactive_zoom_active = true;
+        self.zoom_settle_seq = self.zoom_settle_seq.wrapping_add(1);
+
+        if !self.zoom_anim_running {
+            self.zoom_anim_running = true;
+            cx.spawn(async move |weak, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(16))
+                        .await;
+                    let keep_going = weak
+                        .update(cx, |view, cx| {
+                            let Some((tz, ax, ay)) = view.zoom_anim_target else {
+                                view.zoom_anim_running = false;
+                                view.state.gpu_cache.interactive_zoom_active = false;
+                                cx.notify();
+                                return false;
+                            };
+                            let cur = view.state.viewport.zoom;
+                            let diff = tz - cur;
+                            let cw = view.state.session.bitmap.width();
+                            let ch = view.state.session.bitmap.height();
+                            if diff.abs() <= 0.004 || (diff / cur.max(0.1)).abs() <= 0.006 {
+                                view.state.viewport.zoom_anchored_at(tz, ax, ay);
+                                view.state.viewport.clamp_pan_to_canvas(cw, ch, true);
+                                view.state.zoom_percent = view.state.viewport.zoom_percent();
+                                view.zoom_anim_target = None;
+                                view.zoom_anim_running = false;
+                                view.state.gpu_cache.interactive_zoom_active = false;
+                                cx.notify();
+                                false
+                            } else {
+                                let next = cur + diff * 0.38;
+                                view.state.viewport.zoom_anchored_at(next, ax, ay);
+                                view.state.viewport.clamp_pan_to_canvas(cw, ch, true);
+                                view.state.zoom_percent = view.state.viewport.zoom_percent();
+                                cx.notify();
+                                true
+                            }
+                        })
+                        .unwrap_or(false);
+                    if !keep_going {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
+        cx.notify();
     }
 
     fn ensure_library_view(&mut self, cx: &mut Context<Self>) -> Entity<LibraryOrganizerView> {
@@ -4305,29 +4424,49 @@ impl Render for EditorShellView {
                 div()
                     .flex()
                     .flex_row()
+                    .items_center()
+                    .justify_between()
                     .gap(px(4.0))
                     .child(
-                        Button::new("tab-tool-props", "Tool Properties")
-                            .variant(if self.state.side_panel_tab == SidePanelTab::ToolProperties {
-                                ButtonVariant::Primary
-                            } else {
-                                ButtonVariant::Ghost
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.state.side_panel_tab = SidePanelTab::ToolProperties;
-                                cx.notify();
-                            })),
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(4.0))
+                            .child(
+                                Button::new("tab-tool-props", "Tool Properties")
+                                    .variant(
+                                        if self.state.side_panel_tab == SidePanelTab::ToolProperties {
+                                            ButtonVariant::Primary
+                                        } else {
+                                            ButtonVariant::Ghost
+                                        },
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.state.side_panel_tab = SidePanelTab::ToolProperties;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("tab-effects", "Effects")
+                                    .icon(SnagIcon::Effects)
+                                    .variant(if self.state.side_panel_tab == SidePanelTab::Effects {
+                                        ButtonVariant::Primary
+                                    } else {
+                                        ButtonVariant::Ghost
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.state.side_panel_tab = SidePanelTab::Effects;
+                                        cx.notify();
+                                    })),
+                            ),
                     )
                     .child(
-                        Button::new("tab-effects", "Effects")
-                            .icon(SnagIcon::Effects)
-                            .variant(if self.state.side_panel_tab == SidePanelTab::Effects {
-                                ButtonVariant::Primary
-                            } else {
-                                ButtonVariant::Ghost
-                            })
+                        IconButton::new("toggle-side-collapse", SnagIcon::ChevronRight)
+                            .size(px(26.0))
+                            .tooltip("Collapse Panel", None)
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.state.side_panel_tab = SidePanelTab::Effects;
+                                this.state.show_side_panel = false;
                                 cx.notify();
                             })),
                     ),
@@ -5255,12 +5394,10 @@ impl Render for EditorShellView {
             .flex_row()
             .items_center()
             .gap(px(8.0))
-            .h(px(84.0))
-            .px(px(10.0))
-            .overflow_x_scroll()
-            .bg(theme.panel_bg)
-            .border_t_1()
-            .border_color(theme.border);
+            .size_full()
+            .pl(px(10.0))
+            .pr(px(40.0))
+            .overflow_x_scroll();
 
         for (idx, item) in self.state.recent_captures.iter().enumerate() {
             let path_opt = item.path.clone();
@@ -5365,6 +5502,35 @@ impl Render for EditorShellView {
             );
         }
 
+        let tray_panel = div()
+            .relative()
+            .h(px(84.0))
+            .bg(theme.panel_bg)
+            .border_t_1()
+            .border_color(theme.border)
+            .child(tray_strip)
+            .child(
+                div()
+                    .occlude()
+                    .absolute()
+                    .top(px(6.0))
+                    .right(px(8.0))
+                    .rounded(theme.radius_sm)
+                    .bg(theme.surface_elevated)
+                    .border_1()
+                    .border_color(theme.border)
+                    .shadow_sm()
+                    .child(
+                        IconButton::new("toggle-tray-collapse", SnagIcon::ChevronDown)
+                            .size(px(24.0))
+                            .tooltip("Collapse Recent Tray", None)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.state.show_recent_tray = false;
+                                cx.notify();
+                            })),
+                    ),
+            );
+
         // Bottom Status & Zoom Bar
         let status_bar = div()
             .flex()
@@ -5382,48 +5548,88 @@ impl Render for EditorShellView {
                     .flex_row()
                     .items_center()
                     .gap(px(12.0))
+                    .min_w_0()
+                    .overflow_hidden()
                     .text_xs()
                     .text_color(theme.text_secondary)
                     .child(format!("Canvas: {canvas_w} × {canvas_h} px"))
                     .child(format!("Objects: {obj_count}"))
                     .child(format!("Effects: {}", self.state.applied_effects_count))
-                    .child(self.state.status_message.clone()),
+                    .child(div().truncate().child(self.state.status_message.clone())),
             )
             .child(
                 div()
                     .flex()
                     .flex_row()
+                    .flex_shrink_0()
                     .items_center()
-                    .gap(px(6.0))
+                    .gap(px(4.0))
                     .child(
-                        Button::new("toggle-tray", if self.state.show_recent_tray { "Hide Tray" } else { "Show Tray" })
-                            .variant(ButtonVariant::Ghost)
+                        IconButton::new("zoom-out-btn", SnagIcon::ZoomOut)
+                            .size(px(24.0))
+                            .tooltip("Zoom Out", None)
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.state.show_recent_tray = !this.state.show_recent_tray;
+                                let base = this
+                                    .zoom_anim_target
+                                    .map_or(this.state.viewport.zoom, |(tz, _, _)| tz);
+                                let ax = this.state.viewport.viewport_w * 0.5;
+                                let ay = this.state.viewport.viewport_h * 0.5;
+                                this.animate_zoom_towards(base * 0.80, ax, ay, cx);
+                            })),
+                    )
+                    .child(
+                        Slider::zoom_centered(
+                            "zoom-slider",
+                            self.state.zoom_percent,
+                            10.0,
+                            100.0,
+                            800.0,
+                        )
+                        .width(px(136.0))
+                        .on_change(cx.listener(|this, &z, _, cx| {
+                            let ax = this.state.viewport.viewport_w * 0.5;
+                            let ay = this.state.viewport.viewport_h * 0.5;
+                            this.apply_direct_interactive_zoom(z / 100.0, ax, ay, cx);
+                        })),
+                    )
+                    .child(
+                        IconButton::new("zoom-in-btn", SnagIcon::ZoomIn)
+                            .size(px(24.0))
+                            .tooltip("Zoom In", None)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let base = this
+                                    .zoom_anim_target
+                                    .map_or(this.state.viewport.zoom, |(tz, _, _)| tz);
+                                let ax = this.state.viewport.viewport_w * 0.5;
+                                let ay = this.state.viewport.viewport_h * 0.5;
+                                this.animate_zoom_towards(base * 1.25, ax, ay, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("zoom-reset-100", format!("{:.0}%", self.state.zoom_percent))
+                            .variant(ButtonVariant::Ghost)
+                            .tooltip("Reset Zoom to 100% & Center", None)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.zoom_anim_target = None;
+                                this.state.gpu_cache.interactive_zoom_active = false;
+                                let cw = this.state.session.bitmap.width();
+                                let ch = this.state.session.bitmap.height();
+                                this.state.viewport.center_at_zoom(1.0, cw, ch);
+                                this.state.zoom_percent = 100.0;
                                 cx.notify();
                             })),
                     )
                     .child(
-                        Button::new("toggle-side", if self.state.show_side_panel { "Hide Panel" } else { "Show Panel" })
+                        Button::new("zoom-fit", "Fit")
                             .variant(ButtonVariant::Ghost)
+                            .tooltip("Fit Canvas to Window", None)
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.state.show_side_panel = !this.state.show_side_panel;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Slider::new("zoom-slider", self.state.zoom_percent, 10.0, 800.0)
-                            .width(px(110.0))
-                            .on_change(cx.listener(|this, &z, _, cx| {
-                                this.state.set_zoom(z);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("zoom-fit", format!("{:.0}%", self.state.zoom_percent))
-                            .variant(ButtonVariant::Ghost)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.state.set_zoom(100.0);
+                                this.zoom_anim_target = None;
+                                this.state.gpu_cache.interactive_zoom_active = false;
+                                let cw = this.state.session.bitmap.width();
+                                let ch = this.state.session.bitmap.height();
+                                this.state.viewport.fit_canvas(cw, ch);
+                                this.state.zoom_percent = this.state.viewport.zoom_percent();
                                 cx.notify();
                             })),
                     ),
@@ -5775,6 +5981,16 @@ impl Render for EditorShellView {
                             cx.notify();
                         }
                     }
+                    "space"
+                        if !ctrl
+                            && !ev.keystroke.modifiers.alt
+                            && !this.state.grab_edit_text.modal_open =>
+                    {
+                        if !this.state.viewport.space_panning {
+                            this.state.viewport.space_panning = true;
+                            cx.notify();
+                        }
+                    }
                     _ if !ctrl && !ev.keystroke.modifiers.alt && !this.state.grab_edit_text.modal_open => {
                         if let Some(found) = this
                             .state
@@ -5790,10 +6006,19 @@ impl Render for EditorShellView {
                     _ => {}
                 }
             }))
+            .on_key_up(cx.listener(|this, ev: &KeyUpEvent, _window, cx| {
+                if ev.keystroke.key.eq_ignore_ascii_case("space")
+                    && this.state.viewport.space_panning
+                {
+                    this.state.viewport.space_panning = false;
+                    cx.notify();
+                }
+            }))
             .child(top_bar)
             // Center Workspace + Right Side Panel
             .child(
                 div()
+                    .relative()
                     .flex()
                     .flex_row()
                     .flex_1()
@@ -5872,31 +6097,83 @@ impl Render for EditorShellView {
                                         cx.notify();
                                     }),
                                 )
-                            .on_scroll(cx.listener(
-                                |this, ev: &ScrollEvent, _window, cx| {
-                                    let delta_px = match ev.delta {
-                                        ScrollDelta::Lines(pt) => (pt.x * 24.0, pt.y * 24.0),
-                                        ScrollDelta::Pixels(pt) => (pt.x.into(), pt.y.into()),
-                                    };
-                                    if ev.modifiers.control {
-                                        let factor = if delta_px.1 > 0.0 { 1.12 } else { 0.89 };
+                                .on_mouse_down(
+                                    MouseButton::Middle,
+                                    cx.listener(|this, ev: &MouseDownEvent, _window, cx| {
+                                        this.state.close_all_popovers();
                                         let (ox, oy) = this.canvas_origin.get();
                                         let sx: f32 = ev.position.x.into();
                                         let sy: f32 = ev.position.y.into();
-                                        let next_zoom = this.state.viewport.zoom * factor;
-                                        this.state.viewport.zoom_anchored_at(
-                                            next_zoom,
-                                            (sx - ox).max(0.0),
-                                            (sy - oy).max(0.0),
-                                        );
-                                        this.state.zoom_percent =
-                                            this.state.viewport.zoom_percent();
-                                    } else {
-                                        this.state.viewport.pan_by(delta_px.0, delta_px.1);
-                                    }
-                                    cx.notify();
-                                },
-                            ))
+                                        this.state.active_drag = Some(CanvasDragOp::Pan {
+                                            last_screen: ((sx - ox).max(0.0), (sy - oy).max(0.0)),
+                                        });
+                                        cx.notify();
+                                    }),
+                                )
+                                .on_mouse_up(
+                                    MouseButton::Middle,
+                                    cx.listener(|this, _ev: &MouseUpEvent, _window, cx| {
+                                        if matches!(this.state.active_drag, Some(CanvasDragOp::Pan { .. })) {
+                                            this.state.pointer_up();
+                                            cx.notify();
+                                        }
+                                    }),
+                                )
+                                .on_scroll(cx.listener(
+                                    move |this, ev: &ScrollEvent, _window, cx| {
+                                        if ev.modifiers.control {
+                                            let (ox, oy) = this.canvas_origin.get();
+                                            let sx: f32 = ev.position.x.into();
+                                            let sy: f32 = ev.position.y.into();
+                                            let anchor_x = (sx - ox).max(0.0);
+                                            let anchor_y = (sy - oy).max(0.0);
+                                            match ev.delta {
+                                                ScrollDelta::Lines(pt) => {
+                                                    let notches = pt.y.clamp(-4.0, 4.0);
+                                                    if notches.abs() > 1e-4 {
+                                                        let base = this
+                                                            .zoom_anim_target
+                                                            .map_or(
+                                                                this.state.viewport.zoom,
+                                                                |(tz, _, _)| tz,
+                                                            );
+                                                        let factor = 1.18_f32.powf(notches);
+                                                        this.animate_zoom_towards(
+                                                            base * factor,
+                                                            anchor_x,
+                                                            anchor_y,
+                                                            cx,
+                                                        );
+                                                    }
+                                                }
+                                                ScrollDelta::Pixels(pt) => {
+                                                    let py: f32 = pt.y.into();
+                                                    if py.abs() > 0.05 {
+                                                        let factor = (py * 0.0045).exp();
+                                                        let next_z =
+                                                            this.state.viewport.zoom * factor;
+                                                        this.apply_direct_interactive_zoom(
+                                                            next_z,
+                                                            anchor_x,
+                                                            anchor_y,
+                                                            cx,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            let delta_px = match ev.delta {
+                                                ScrollDelta::Lines(pt) => (pt.x * 28.0, pt.y * 28.0),
+                                                ScrollDelta::Pixels(pt) => (pt.x.into(), pt.y.into()),
+                                            };
+                                            this.state.viewport.pan_by(delta_px.0, delta_px.1);
+                                            this.state
+                                                .viewport
+                                                .clamp_pan_to_canvas(canvas_w, canvas_h, false);
+                                            cx.notify();
+                                        }
+                                    },
+                                ))
                             .child(render_canvas_surface(
                                 &self.state.viewport,
                                 &self.state.gpu_cache,
@@ -6105,6 +6382,52 @@ impl Render for EditorShellView {
                     })
                     .when(self.state.show_side_panel && viewport_w >= 680.0, |el| {
                         el.child(side_panel)
+                    })
+                    .when(!self.state.show_side_panel && viewport_w >= 680.0, |el| {
+                        el.child(
+                            div()
+                                .occlude()
+                                .absolute()
+                                .top(px(8.0))
+                                .right(px(8.0))
+                                .rounded(theme.radius_sm)
+                                .bg(theme.surface_elevated)
+                                .border_1()
+                                .border_color(theme.border)
+                                .shadow_sm()
+                                .child(
+                                    IconButton::new("toggle-side-expand", SnagIcon::ChevronLeft)
+                                        .size(px(26.0))
+                                        .tooltip("Expand Panel", None)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.state.show_side_panel = true;
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                    })
+                    .when(!self.state.show_recent_tray, |el| {
+                        el.child(
+                            div()
+                                .occlude()
+                                .absolute()
+                                .bottom(px(8.0))
+                                .right(px(8.0))
+                                .rounded(theme.radius_sm)
+                                .bg(theme.surface_elevated)
+                                .border_1()
+                                .border_color(theme.border)
+                                .shadow_sm()
+                                .child(
+                                    IconButton::new("toggle-tray-expand", SnagIcon::ChevronUp)
+                                        .size(px(26.0))
+                                        .tooltip("Expand Recent Tray", None)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.state.show_recent_tray = true;
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
                     }),
             )
             .when(self.state.video_player.path.is_some(), |el| {
@@ -6334,7 +6657,7 @@ impl Render for EditorShellView {
                         .child(render_video_timeline(&self.state.video_player, theme)),
                 )
             })
-            .when(self.state.show_recent_tray, |el| el.child(tray_strip))
+            .when(self.state.show_recent_tray, |el| el.child(tray_panel))
             .child(status_bar)
             // Click-outside transparent backdrop whenever any dropdown menu is open
             .when(any_popover_open, |el| {
@@ -7469,5 +7792,78 @@ mod tests {
         assert_eq!(st.active_custom_tool_cursor_mode(), None);
         st.viewport.space_panning = false;
         assert_eq!(st.active_custom_tool_cursor_mode(), Some(ToolMode::Arrow));
+    }
+
+    #[test]
+    fn move_tool_pans_canvas_and_interactive_gpu_zoom_keeps_canvas_framed() {
+        let mut st = EditorShellState::default();
+        st.viewport.device_scale = 1.25;
+        st.viewport.viewport_w = 1100.0;
+        st.viewport.viewport_h = 680.0;
+        st.viewport.fit_canvas(1280, 720);
+
+        // 1. Zooming out (`69%`) near an extreme edge must NEVER push a smaller-than-viewport canvas into negative `pan_x`
+        st.viewport.pan_x = -240.0;
+        st.viewport.zoom_anchored_at(0.69, 980.0, 500.0);
+        st.viewport.clamp_pan_to_canvas(1280, 720, true);
+        assert!(
+            st.viewport.pan_x >= 12.0,
+            "zoomed-out canvas fitting in viewport must stay >= 12px from left edge, got {}",
+            st.viewport.pan_x
+        );
+
+        // 2. Selecting `Move` and dragging empty canvas pans `pan_x` / `pan_y` directly
+        st.select_tool(ToolMode::Move);
+        let orig_pan_x = st.viewport.pan_x;
+        let orig_pan_y = st.viewport.pan_y;
+        st.pointer_down(200.0, 200.0, false, 1);
+        assert!(matches!(st.active_drag, Some(CanvasDragOp::Pan { .. })));
+        assert!(st.pointer_move(260.0, 230.0));
+        st.pointer_up();
+        assert!((st.viewport.pan_x - (orig_pan_x + 60.0)).abs() <= 1.0);
+        assert!((st.viewport.pan_y - (orig_pan_y + 30.0)).abs() <= 1.0);
+
+        // 3. Clicking an annotation with `Move` drags the object instead of panning the viewport
+        let col = ColorRgba::rgb(217, 43, 43);
+        let obj_idx = st.gizmos_g1.create_object(
+            &mut st.session,
+            ToolMode::Shape,
+            PointF::new(100.0, 100.0),
+            PointF::new(220.0, 200.0),
+            col,
+            col,
+            4.0,
+            100.0,
+        );
+        let (hit_sx, hit_sy) = st.viewport.canvas_to_screen(PointF::new(150.0, 150.0));
+        let pan_before = (st.viewport.pan_x, st.viewport.pan_y);
+        st.pointer_down(hit_sx, hit_sy, false, 1);
+        assert!(matches!(st.active_drag, Some(CanvasDragOp::MoveObject { .. })));
+        assert!(st.pointer_move(hit_sx + 40.0, hit_sy + 20.0));
+        st.pointer_up();
+        assert_eq!((st.viewport.pan_x, st.viewport.pan_y), pan_before);
+        assert!(st.session.page.capture_objects[obj_idx].start_point.unwrap().x > 120.0);
+
+        // 4. Interactive GPU zoom skips CPU `dirty_rebuilds` during motion, then bakes crisp viewport once settled
+        let vp_init = st.viewport.clone();
+        st.gpu_cache.sync_from_session(&mut st.session, &vp_init);
+        let rebuilds_before = st.gpu_cache.dirty_rebuilds;
+
+        st.gpu_cache.interactive_zoom_active = true;
+        for pct in [80.0, 120.0, 165.0, 240.0] {
+            st.set_zoom(pct);
+            let vp = st.viewport.clone();
+            st.gpu_cache.sync_from_session(&mut st.session, &vp);
+        }
+        assert!(st.gpu_cache.base_scene_image.is_some());
+        assert_eq!(
+            st.gpu_cache.dirty_rebuilds, rebuilds_before,
+            "interactive GPU zoom frames must not trigger per-frame CPU viewport rasterization"
+        );
+
+        st.gpu_cache.interactive_zoom_active = false;
+        let vp_settled = st.viewport.clone();
+        st.gpu_cache.sync_from_session(&mut st.session, &vp_settled);
+        assert_eq!(st.gpu_cache.dirty_rebuilds, rebuilds_before + 1);
     }
 }

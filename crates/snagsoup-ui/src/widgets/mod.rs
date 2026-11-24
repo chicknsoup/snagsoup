@@ -3,12 +3,14 @@
 //! Includes `Button`, `IconButton`, `NumericStepper`, `Slider`, `Popover`,
 //! `ColorSwatchPicker`, and native GPUI `RichTooltip` (replacing WebView2).
 
+use std::cell::Cell;
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, AppContext, ClickEvent, Context, ElementId, InteractiveElement, IntoElement,
-    ParentElement, Pixels, Render, RenderOnce, SharedString, StatefulInteractiveElement, Styled,
-    Window, div, prelude::FluentBuilder, px, rgb,
+    AnyElement, App, AppContext, ClickEvent, Context, DragMoveEvent, ElementId, InteractiveElement,
+    IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Render, RenderOnce,
+    SharedString, StatefulInteractiveElement, Styled, Window, canvas, div, prelude::FluentBuilder,
+    px, rgb,
 };
 
 use crate::icons::SnagIcon;
@@ -538,7 +540,19 @@ impl RenderOnce for NumericStepper {
     }
 }
 
-/// Horizontal continuous slider with stepped click stops for opacity, blur, tolerance, and zoom.
+#[derive(Clone)]
+struct SliderDrag(ElementId);
+
+struct InvisibleDragGhost;
+
+impl Render for InvisibleDragGhost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size(px(0.0))
+    }
+}
+
+/// Horizontal continuous slider supporting direct click-to-position, smooth window-wide thumb
+/// dragging, and optional center-anchored bipolar mode (e.g., `100%` zoom at `50%` center).
 #[derive(IntoElement)]
 pub struct Slider {
     id: ElementId,
@@ -546,19 +560,45 @@ pub struct Slider {
     value: f32,
     min: f32,
     max: f32,
+    center_anchor: Option<(f32, bool)>,
     width: Pixels,
     on_change: Option<Rc<dyn Fn(&f32, &mut Window, &mut App) + 'static>>,
 }
 
 impl Slider {
     pub fn new(id: impl Into<ElementId>, value: f32, min: f32, max: f32) -> Self {
+        let safe_max = max.max(min + 0.001);
         Self {
             id: id.into(),
             label: None,
-            value: value.clamp(min, max),
+            value: value.clamp(min, safe_max),
             min,
-            max: max.max(min + 0.001),
+            max: safe_max,
+            center_anchor: None,
             width: px(160.0),
+            on_change: None,
+        }
+    }
+
+    /// Construct a center-anchored Zoom slider (`min..=max` with `mid` pinned at `50%` center,
+    /// linear zoom-out on the left half and logarithmic `2^x` magnification on the right half).
+    pub fn zoom_centered(
+        id: impl Into<ElementId>,
+        value: f32,
+        min: f32,
+        mid: f32,
+        max: f32,
+    ) -> Self {
+        let safe_max = max.max(mid + 1.0);
+        let safe_min = min.min(mid - 1.0);
+        Self {
+            id: id.into(),
+            label: None,
+            value: value.clamp(safe_min, safe_max),
+            min: safe_min,
+            max: safe_max,
+            center_anchor: Some((mid, true)),
+            width: px(124.0),
             on_change: None,
         }
     }
@@ -581,8 +621,62 @@ impl Slider {
         self
     }
 
+    /// Map `value` into `[0.0, 1.0]` track position.
     pub fn normalized(&self) -> f32 {
-        ((self.value - self.min) / (self.max - self.min)).clamp(0.0, 1.0)
+        Self::value_to_ratio(self.value, self.min, self.max, self.center_anchor)
+    }
+
+    /// Pure mapping from domain `value` to `[0.0, 1.0]` slider ratio.
+    pub fn value_to_ratio(
+        value: f32,
+        min: f32,
+        max: f32,
+        center_anchor: Option<(f32, bool)>,
+    ) -> f32 {
+        let v = value.clamp(min, max);
+        if let Some((mid, log_upper)) = center_anchor {
+            if (v - mid).abs() < 1e-3 {
+                return 0.5;
+            } else if v < mid {
+                let span = (mid - min).max(1e-4);
+                return (((v - min) / span) * 0.5).clamp(0.0, 0.5);
+            } else if log_upper && mid > 0.0 && max > mid {
+                let log_span = (max / mid).ln().max(1e-4);
+                let t = ((v / mid).ln() / log_span).clamp(0.0, 1.0);
+                return (0.5 + 0.5 * t).clamp(0.5, 1.0);
+            } else {
+                let span = (max - mid).max(1e-4);
+                return (0.5 + ((v - mid) / span) * 0.5).clamp(0.5, 1.0);
+            }
+        }
+        ((v - min) / (max - min).max(1e-4)).clamp(0.0, 1.0)
+    }
+
+    /// Pure mapping from `[0.0, 1.0]` track ratio back to domain `value`
+    /// (with a gentle magnetic snap around `0.5` when `center_anchor` is active).
+    pub fn ratio_to_value(
+        raw_ratio: f32,
+        min: f32,
+        max: f32,
+        center_anchor: Option<(f32, bool)>,
+    ) -> f32 {
+        let r = raw_ratio.clamp(0.0, 1.0);
+        if let Some((mid, log_upper)) = center_anchor {
+            if (r - 0.5).abs() <= 0.025 {
+                return mid;
+            }
+            if r < 0.5 {
+                let t = (r / 0.5).clamp(0.0, 1.0);
+                return (min + t * (mid - min)).clamp(min, mid);
+            }
+            let t = ((r - 0.5) / 0.5).clamp(0.0, 1.0);
+            if log_upper && mid > 0.0 && max > mid {
+                let ratio_hi = max / mid;
+                return (mid * ratio_hi.powf(t)).clamp(mid, max);
+            }
+            return (mid + t * (max - mid)).clamp(mid, max);
+        }
+        (min + r * (max - min)).clamp(min, max)
     }
 }
 
@@ -595,12 +689,28 @@ impl RenderOnce for Slider {
 
         let ratio = self.normalized();
         let track_width: f32 = self.width.into();
-        let fill_width = px(track_width * ratio);
-        let thumb_offset = px((track_width * ratio - 6.0).clamp(0.0, track_width - 12.0));
-        let on_change = self.on_change;
+        let center_anchor = self.center_anchor;
+        let (fill_left, fill_width) = if center_anchor.is_some() {
+            let mid_px = track_width * 0.5;
+            let cur_px = track_width * ratio;
+            if cur_px < mid_px {
+                (px(cur_px), px((mid_px - cur_px).max(0.0)))
+            } else {
+                (px(mid_px), px((cur_px - mid_px).max(0.0)))
+            }
+        } else {
+            (px(0.0), px(track_width * ratio))
+        };
+        let thumb_offset = px((track_width * ratio - 6.0).clamp(0.0, (track_width - 12.0).max(0.0)));
+        let on_change_down = self.on_change.clone();
+        let on_change_drag = self.on_change;
         let min = self.min;
         let max = self.max;
-        let current = self.value;
+        let track_bounds_cell = Rc::new(Cell::new((0.0_f32, track_width.max(1.0))));
+        let bounds_for_probe = Rc::clone(&track_bounds_cell);
+        let bounds_for_down = Rc::clone(&track_bounds_cell);
+        let drag_id = self.id.clone();
+        let drag_id_check = self.id.clone();
 
         div()
             .flex()
@@ -627,18 +737,51 @@ impl RenderOnce for Slider {
                     .flex()
                     .items_center()
                     .cursor_pointer()
-                    .on_click(move |_ev, window, cx| {
-                        // Cycle by +10% on direct click as a lightweight keyboard/click fallback.
-                        if let Some(cb) = &on_change {
-                            let step = (max - min) * 0.1;
-                            let next = if current + step > max {
-                                min
-                            } else {
-                                (current + step).clamp(min, max)
-                            };
+                    .on_mouse_down(MouseButton::Left, move |ev: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        if let Some(cb) = &on_change_down {
+                            if ev.click_count >= 2
+                                && let Some((mid, _)) = center_anchor
+                            {
+                                cb(&mid, window, cx);
+                                return;
+                            }
+                            let (left_x, w) = bounds_for_down.get();
+                            let mouse_x: f32 = ev.position.x.into();
+                            let raw_r = ((mouse_x - left_x) / w.max(1.0)).clamp(0.0, 1.0);
+                            let next = Slider::ratio_to_value(raw_r, min, max, center_anchor);
                             cb(&next, window, cx);
                         }
                     })
+                    .on_drag(SliderDrag(drag_id), |_, _, _, cx| {
+                        cx.new(|_| InvisibleDragGhost)
+                    })
+                    .on_drag_move(move |ev: &DragMoveEvent<SliderDrag>, window, cx| {
+                        if ev.drag(cx).0 != drag_id_check {
+                            return;
+                        }
+                        if let Some(cb) = &on_change_drag {
+                            let left_x: f32 = ev.bounds.origin.x.into();
+                            let w: f32 = ev.bounds.size.width.into();
+                            let mouse_x: f32 = ev.event.position.x.into();
+                            let raw_r = ((mouse_x - left_x) / w.max(1.0)).clamp(0.0, 1.0);
+                            let next = Slider::ratio_to_value(raw_r, min, max, center_anchor);
+                            cb(&next, window, cx);
+                        }
+                    })
+                    .child(
+                        canvas(
+                            move |bounds, _window, _cx| {
+                                bounds_for_probe.set((
+                                    bounds.origin.x.into(),
+                                    f32::from(bounds.size.width).max(1.0),
+                                ));
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .inset_0(),
+                    )
                     .child(
                         div()
                             .w_full()
@@ -646,10 +789,21 @@ impl RenderOnce for Slider {
                             .rounded(px(2.0))
                             .bg(theme.border),
                     )
+                    .when(center_anchor.is_some(), |el| {
+                        el.child(
+                            div()
+                                .absolute()
+                                .left(px((track_width * 0.5 - 1.0).max(0.0)))
+                                .w(px(2.0))
+                                .h(px(10.0))
+                                .rounded(px(1.0))
+                                .bg(theme.border_strong),
+                        )
+                    })
                     .child(
                         div()
                             .absolute()
-                            .left(px(0.0))
+                            .left(fill_left)
                             .w(fill_width)
                             .h(px(4.0))
                             .rounded(px(2.0))
@@ -875,5 +1029,22 @@ mod tests {
 
         let high = Slider::new("high", 200.0, 0.0, 100.0);
         assert!((high.normalized() - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn zoom_centered_slider_pins_100_percent_at_midpoint() {
+        let anchor = Some((100.0, true));
+        assert!((Slider::value_to_ratio(10.0, 10.0, 800.0, anchor) - 0.0).abs() < 1e-5);
+        assert!((Slider::value_to_ratio(55.0, 10.0, 800.0, anchor) - 0.25).abs() < 1e-5);
+        assert!((Slider::value_to_ratio(100.0, 10.0, 800.0, anchor) - 0.5).abs() < 1e-5);
+        assert!((Slider::value_to_ratio(200.0, 10.0, 800.0, anchor) - (0.5 + 0.5 / 3.0)).abs() < 1e-4);
+        assert!((Slider::value_to_ratio(400.0, 10.0, 800.0, anchor) - (0.5 + 1.0 / 3.0)).abs() < 1e-4);
+        assert!((Slider::value_to_ratio(800.0, 10.0, 800.0, anchor) - 1.0).abs() < 1e-5);
+
+        // Magnetic snap near center (`0.5 ± 0.025`) locks cleanly onto `100%`
+        assert!((Slider::ratio_to_value(0.485, 10.0, 800.0, anchor) - 100.0).abs() < 1e-5);
+        assert!((Slider::ratio_to_value(0.515, 10.0, 800.0, anchor) - 100.0).abs() < 1e-5);
+        assert!((Slider::ratio_to_value(0.0, 10.0, 800.0, anchor) - 10.0).abs() < 1e-4);
+        assert!((Slider::ratio_to_value(1.0, 10.0, 800.0, anchor) - 800.0).abs() < 1e-3);
     }
 }

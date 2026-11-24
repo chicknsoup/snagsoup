@@ -54,6 +54,8 @@ pub enum SnagIcon {
     RecordDot,
     Check,
     ChevronRight,
+    ChevronLeft,
+    ChevronUp,
 }
 
 impl SnagIcon {
@@ -106,6 +108,8 @@ impl SnagIcon {
             Self::RecordDot => "icons/record_dot.svg",
             Self::Check => "icons/check.svg",
             Self::ChevronRight => "icons/chevron_right.svg",
+            Self::ChevronLeft => "icons/chevron_left.svg",
+            Self::ChevronUp => "icons/chevron_up.svg",
         }
     }
 
@@ -158,6 +162,8 @@ impl SnagIcon {
             Self::RecordDot => r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5" fill="currentColor"/></svg>"#,
             Self::Check => r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>"#,
             Self::ChevronRight => r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>"#,
+            Self::ChevronLeft => r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>"#,
+            Self::ChevronUp => r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 15 12 9 6 15"/></svg>"#,
         }
     }
 
@@ -209,6 +215,8 @@ impl SnagIcon {
         Self::RecordDot,
         Self::Check,
         Self::ChevronRight,
+        Self::ChevronLeft,
+        Self::ChevronUp,
     ];
 
     /// Lookup embedded SVG bytes by asset path.

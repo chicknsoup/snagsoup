@@ -141,11 +141,65 @@ impl CanvasViewportState {
         self.pan_y = (raw_py * dev).round() / dev;
     }
 
-    /// Pan viewport by screen pixel delta (`Space + Drag`).
+    /// Pan viewport by screen pixel delta (`Space + Drag` / `Move` background drag / Middle-Click drag).
     pub fn pan_by(&mut self, dx: f32, dy: f32) {
         let dev = self.device_scale.max(0.5);
         self.pan_x = ((self.pan_x + dx) * dev).round() / dev;
         self.pan_y = ((self.pan_y + dy) * dev).round() / dev;
+    }
+
+    /// Keep the canvas comfortably reachable inside the viewport:
+    /// - When `keep_framed_when_smaller` is `true` (during zoom) and the scaled canvas fits inside
+    ///   the viewport along an axis, clamp pan so the image stays fully inside `[12..viewport - scaled - 12]`
+    ///   (never clipped off the left/top edge with empty gray space on the right/bottom).
+    /// - Otherwise, keep at least `96 px` (or half the image if tiny) visible inside the viewport.
+    pub fn clamp_pan_to_canvas(
+        &mut self,
+        canvas_w: u32,
+        canvas_h: u32,
+        keep_framed_when_smaller: bool,
+    ) {
+        let eff = self.effective_logical_zoom();
+        let dev = self.device_scale.max(0.5);
+        let sw = (canvas_w.max(1) as f32) * eff;
+        let sh = (canvas_h.max(1) as f32) * eff;
+        let vw = self.viewport_w.max(120.0);
+        let vh = self.viewport_h.max(120.0);
+        let pad = 12.0;
+
+        let clamped_x = if keep_framed_when_smaller && sw + pad * 2.0 <= vw {
+            self.pan_x.clamp(pad, (vw - sw - pad).max(pad))
+        } else {
+            let keep_x = sw.min(96.0).min(vw * 0.45);
+            let min_x = keep_x - sw;
+            let max_x = (vw - keep_x).max(min_x);
+            self.pan_x.clamp(min_x, max_x)
+        };
+
+        let clamped_y = if keep_framed_when_smaller && sh + pad * 2.0 <= vh {
+            self.pan_y.clamp(pad, (vh - sh - pad).max(pad))
+        } else {
+            let keep_y = sh.min(96.0).min(vh * 0.45);
+            let min_y = keep_y - sh;
+            let max_y = (vh - keep_y).max(min_y);
+            self.pan_y.clamp(min_y, max_y)
+        };
+
+        self.pan_x = (clamped_x * dev).round() / dev;
+        self.pan_y = (clamped_y * dev).round() / dev;
+    }
+
+    /// Center the canvas cleanly inside the viewport at a specific `new_zoom` scale (`0.10..=8.00`).
+    pub fn center_at_zoom(&mut self, new_zoom: f32, canvas_w: u32, canvas_h: u32) {
+        self.zoom = new_zoom.clamp(0.10, 8.00);
+        let eff = self.effective_logical_zoom();
+        let dev = self.device_scale.max(0.5);
+        let sw = (canvas_w.max(1) as f32) * eff;
+        let sh = (canvas_h.max(1) as f32) * eff;
+        let raw_px = (self.viewport_w - sw) * 0.5;
+        let raw_py = (self.viewport_h - sh) * 0.5;
+        self.pan_x = (raw_px * dev).round() / dev;
+        self.pan_y = (raw_py * dev).round() / dev;
     }
 
     /// Fit the canvas cleanly inside the viewport with margin.
@@ -279,11 +333,40 @@ impl CanvasViewportState {
     }
 }
 
+fn composite_checkerboard_inplace(vw: u32, rgba: &mut [u8]) {
+    if rgba.chunks_exact(4).any(|px| px[3] < 255) {
+        let w_u = vw.max(1) as usize;
+        for (i, px) in rgba.chunks_exact_mut(4).enumerate() {
+            let a = px[3] as u32;
+            if a < 255 {
+                let x = i % w_u;
+                let y = i / w_u;
+                let even = ((x / 8) + (y / 8)) % 2 == 0;
+                let (br, bg, bb) = if even {
+                    (255u32, 255u32, 255u32)
+                } else {
+                    (226u32, 232u32, 240u32)
+                };
+                let inv = 255 - a;
+                px[0] = ((px[0] as u32 * a + br * inv + 127) / 255) as u8;
+                px[1] = ((px[1] as u32 * a + bg * inv + 127) / 255) as u8;
+                px[2] = ((px[2] as u32 * a + bb * inv + 127) / 255) as u8;
+                px[3] = 255;
+            }
+        }
+    }
+}
+
 /// GPU tile/viewport texture cache keyed by [`TileCoord`], invalidated incrementally via `DirtyRegion`.
 #[derive(Default)]
 pub struct CanvasGpuCache {
     /// Cached per-tile `RenderImage`s (for 256x256 incremental uploads).
     pub tile_textures: HashMap<TileCoord, Arc<RenderImage>>,
+    /// Cached full-scene GPU texture used for zero-CPU 120fps hardware quad scaling during live zoom gestures.
+    pub base_scene_image: Option<Arc<RenderImage>>,
+    pub base_scene_dims: (u32, u32),
+    /// True while an interactive zoom drag / wheel animation is actively in motion.
+    pub interactive_zoom_active: bool,
     /// Last rendered visible viewport image (`SceneCompositor::render_viewport`).
     pub viewport_image: Option<Arc<RenderImage>>,
     pub viewport_rect: RectF,
@@ -293,6 +376,30 @@ pub struct CanvasGpuCache {
 }
 
 impl CanvasGpuCache {
+    fn ensure_base_scene_image(&mut self, session: &DocumentSession) {
+        let cw = session.bitmap.width();
+        let ch = session.bitmap.height();
+        if cw == 0 || ch == 0 {
+            return;
+        }
+        if self.base_scene_image.is_some() && self.base_scene_dims == (cw, ch) {
+            return;
+        }
+        let comp = SceneCompositor::new(&session.page, Some(&session.bitmap));
+        let rendered = if cw <= 4096 && ch <= 4096 {
+            comp.flatten_to_rgba()
+        } else {
+            comp.generate_thumbnail_rgba(2560, 2560)
+        };
+        if let Ok((bw, bh, mut rgba)) = rendered {
+            composite_checkerboard_inplace(bw, &mut rgba);
+            if let Some(img) = crate::rgba_to_bgra_render_image(bw, bh, &rgba) {
+                self.base_scene_image = Some(img);
+                self.base_scene_dims = (cw, ch);
+            }
+        }
+    }
+
     /// Synchronize dirty tiles from `session` and refresh the culled viewport image when needed.
     pub fn sync_from_session(
         &mut self,
@@ -307,11 +414,19 @@ impl CanvasGpuCache {
             if dirty.tiles.is_empty() {
                 self.tile_textures.clear();
             }
+            self.base_scene_image = None;
             self.viewport_image = None;
         }
 
         let cw = session.bitmap.width();
         let ch = session.bitmap.height();
+        if self.interactive_zoom_active {
+            self.ensure_base_scene_image(session);
+            if self.base_scene_image.is_some() {
+                return;
+            }
+        }
+
         let vis = viewport.visible_canvas_rect(cw, ch);
         let render_zoom = viewport.zoom.clamp(0.10, 8.00);
 
@@ -325,27 +440,7 @@ impl CanvasGpuCache {
                     // Composite any semi-transparent/erased pixels over an 8×8 light gray/white
                     // checkerboard (#FFFFFF / #E2E8F0) for on-screen visibility while keeping
                     // `session.bitmap` true alpha=0 intact for PNG/Clipboard exports!
-                    if rgba.chunks_exact(4).any(|px| px[3] < 255) {
-                        let w_u = vw as usize;
-                        for (i, px) in rgba.chunks_exact_mut(4).enumerate() {
-                            let a = px[3] as u32;
-                            if a < 255 {
-                                let x = i % w_u;
-                                let y = i / w_u;
-                                let even = ((x / 8) + (y / 8)) % 2 == 0;
-                                let (br, bg, bb) = if even {
-                                    (255u32, 255u32, 255u32)
-                                } else {
-                                    (226u32, 232u32, 240u32)
-                                };
-                                let inv = 255 - a;
-                                px[0] = ((px[0] as u32 * a + br * inv + 127) / 255) as u8;
-                                px[1] = ((px[1] as u32 * a + bg * inv + 127) / 255) as u8;
-                                px[2] = ((px[2] as u32 * a + bb * inv + 127) / 255) as u8;
-                                px[3] = 255;
-                            }
-                        }
-                    }
+                    composite_checkerboard_inplace(vw, &mut rgba);
                     if let Some(render_img) = crate::rgba_to_bgra_render_image(vw, vh, &rgba) {
                         self.viewport_image = Some(render_img);
                         self.viewport_rect = vis;
@@ -371,8 +466,14 @@ pub fn render_canvas_surface(
 ) -> impl IntoElement {
     let dev_scale = viewport.device_scale.max(0.5);
     let eff_zoom = viewport.effective_logical_zoom();
-    let pan_x = (viewport.pan_x * dev_scale).round() / dev_scale;
-    let pan_y = (viewport.pan_y * dev_scale).round() / dev_scale;
+    let (pan_x, pan_y) = if cache.interactive_zoom_active {
+        (viewport.pan_x, viewport.pan_y)
+    } else {
+        (
+            (viewport.pan_x * dev_scale).round() / dev_scale,
+            (viewport.pan_y * dev_scale).round() / dev_scale,
+        )
+    };
     let scaled_w = canvas_w as f32 * eff_zoom;
     let scaled_h = canvas_h as f32 * eff_zoom;
     let show_grid = viewport.should_show_pixel_grid();
@@ -384,8 +485,8 @@ pub fn render_canvas_surface(
         .overflow_hidden()
         .bg(theme.canvas_well_bg);
 
-    // Canvas backing frame positioned on an exact integer physical pixel `(pan_x, pan_y)`
-    // with ZERO inner border on `canvas_box` itself so `img` never shifts by fractional subpixels (`1.25px`)!
+    // Canvas backing frame positioned on an exact integer physical pixel `(pan_x, pan_y)` when settled
+    // (and continuous subpixel `(pan_x, pan_y)` while zooming smoothly), with ZERO inner border on `canvas_box`!
     let mut canvas_box = div()
         .absolute()
         .left(px(pan_x))
@@ -402,7 +503,18 @@ pub fn render_canvas_surface(
                 .border_color(theme.border_strong),
         );
 
-    if let Some(ref render_img) = cache.viewport_image {
+    if cache.interactive_zoom_active
+        && let Some(ref base_img) = cache.base_scene_image
+    {
+        canvas_box = canvas_box.child(
+            img(base_img.clone())
+                .absolute()
+                .left(px(0.0))
+                .top(px(0.0))
+                .w(px(scaled_w))
+                .h(px(scaled_h)),
+        );
+    } else if let Some(ref render_img) = cache.viewport_image {
         let vis = cache.viewport_rect;
         let (vw, vh) = cache.cached_image_px;
         let img_left = ((vis.x as f32 * viewport.zoom).round()) / dev_scale;
@@ -424,6 +536,15 @@ pub fn render_canvas_surface(
                 .top(px(img_top))
                 .w(px(img_w))
                 .h(px(img_h)),
+        );
+    } else if let Some(ref base_img) = cache.base_scene_image {
+        canvas_box = canvas_box.child(
+            img(base_img.clone())
+                .absolute()
+                .left(px(0.0))
+                .top(px(0.0))
+                .w(px(scaled_w))
+                .h(px(scaled_h)),
         );
     }
 
