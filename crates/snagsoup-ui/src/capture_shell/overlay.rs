@@ -538,10 +538,11 @@ fn crop_from_bgra_render_image(
     };
 
     let cursor_obj = if include_cursor {
-        cursor.map(|c| {
+        cursor.and_then(|c| {
             let ox = bounds.left + cx as i32;
             let oy = bounds.top + cy as i32;
-            c.to_capture_object("captured-cursor", ox, oy)
+            c.intersects_rect(ox, oy, cw, ch)
+                .then(|| c.to_capture_object("captured-cursor", ox, oy))
         })
     } else {
         None
@@ -584,10 +585,11 @@ pub fn crop_frozen_screen(
         .unwrap_or_else(|_| TiledBitmap::new_filled(cw, ch, ColorRgba::WHITE));
 
     let cursor_obj = if include_cursor {
-        frozen.cursor.as_ref().map(|c| {
+        frozen.cursor.as_ref().and_then(|c| {
             let ox = frozen.frame.bounds.left + cx as i32;
             let oy = frozen.frame.bounds.top + cy as i32;
-            c.to_capture_object("captured-cursor", ox, oy)
+            c.intersects_rect(ox, oy, cw, ch)
+                .then(|| c.to_capture_object("captured-cursor", ox, oy))
         })
     } else {
         None
@@ -2272,5 +2274,72 @@ mod tests {
                 assert!(rx > lx && ry > ly);
             }
         }
+    }
+
+    #[test]
+    fn captured_cursor_renders_real_bitmap_without_red_square_and_skips_outside_crop() {
+        let bounds = PhysicalRect::new(0, 0, 200, 200);
+        let mut cur_rgba = vec![0u8; 16 * 16 * 4];
+        // Paint a solid emerald cursor pixel block at (2..6, 2..6) inside the 16x16 cursor
+        for y in 2..6 {
+            for x in 2..6 {
+                let idx = (y * 16 + x) * 4;
+                cur_rgba[idx..idx + 4].copy_from_slice(&[16, 185, 129, 255]);
+            }
+        }
+        let cursor = snagsoup_win_platform::cursor::CapturedCursor {
+            screen_x: 50,
+            screen_y: 50,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            width: 16,
+            height: 16,
+            rgba: cur_rgba,
+        };
+        let frozen = FrozenScreen {
+            frame: snagsoup_capture::CapturedFrame {
+                bounds,
+                width: 200,
+                height: 200,
+                rgba: vec![255u8; 200 * 200 * 4],
+                backend: snagsoup_capture::CaptureBackend::GdiFallback,
+                elapsed_ms: 1.0,
+            },
+            topology: snagsoup_win_platform::dpi::DisplayTopology {
+                virtual_bounds: bounds,
+                monitors: Vec::new(),
+            },
+            cursor: Some(cursor),
+        };
+
+        // 1. Cropping a region far from (50, 50) skips attaching an off-canvas cursor object
+        let (_bmp_out, cur_outside) =
+            crop_frozen_screen(&frozen, RectF::new(120.0, 120.0, 60.0, 60.0), true);
+        assert!(cur_outside.is_none());
+
+        // 2. Cropping a region containing (50, 50) embeds the PNG cursor and renders real emerald pixels (zero #D92B2B red!)
+        let (bmp_in, cur_inside) =
+            crop_frozen_screen(&frozen, RectF::new(40.0, 40.0, 60.0, 60.0), true);
+        let cur_obj = cur_inside.expect("cursor inside crop rect must be attached");
+        assert!(cur_obj.image.as_deref().is_some_and(|s| !s.is_empty()));
+
+        let page = snagsoup_model::SnagxPage {
+            capture_canvas_width: Some(60.0),
+            capture_canvas_height: Some(60.0),
+            capture_background_color: Some(ColorRgba::WHITE),
+            capture_objects: vec![cur_obj],
+            ..Default::default()
+        };
+        let comp = snagsoup_canvas::SceneCompositor::new(&page, Some(&bmp_in));
+        let (fw, fh, flat) = comp.flatten_to_rgba().expect("flatten succeeds");
+        assert_eq!((fw, fh), (60, 60));
+
+        // Cursor top-left is at (50 - 40, 50 - 40) = (10, 10), so emerald pixel is at (13, 13)
+        let p_idx = (13 * 60 + 13) * 4;
+        assert_eq!(&flat[p_idx..p_idx + 4], &[16, 185, 129, 255]);
+        assert!(
+            !flat.chunks_exact(4).any(|px| px[0] == 217 && px[1] == 43 && px[2] == 43),
+            "flattened capture with cursor must never contain default #D92B2B red rectangle border"
+        );
     }
 }

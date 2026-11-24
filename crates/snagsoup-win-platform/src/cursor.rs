@@ -53,8 +53,28 @@ impl CapturedCursor {
         self.screen_y - self.hotspot_y
     }
 
+    /// Returns `true` if this cursor's bitmap bounding box intersects the target capture region
+    /// `[origin_x .. origin_x + rect_w, origin_y .. origin_y + rect_h]`.
+    pub fn intersects_rect(&self, origin_x: i32, origin_y: i32, rect_w: u32, rect_h: u32) -> bool {
+        if self.width == 0 || self.height == 0 || rect_w == 0 || rect_h == 0 {
+            return false;
+        }
+        let cx0 = self.top_left_x() as i64;
+        let cy0 = self.top_left_y() as i64;
+        let cx1 = cx0 + self.width as i64;
+        let cy1 = cy0 + self.height as i64;
+
+        let rx0 = origin_x as i64;
+        let ry0 = origin_y as i64;
+        let rx1 = rx0 + rect_w as i64;
+        let ry1 = ry0 + rect_h as i64;
+
+        cx0 < rx1 && cx1 > rx0 && cy0 < ry1 && cy1 > ry0
+    }
+
     /// Convert this captured cursor into a `.snagx` `CaptureObject` relative to the
-    /// captured canvas origin `(canvas_origin_x, canvas_origin_y)`.
+    /// captured canvas origin `(canvas_origin_x, canvas_origin_y)`, embedding the RGBA8
+    /// cursor bitmap as a Base64-encoded PNG so `SceneCompositor` renders the real cursor.
     pub fn to_capture_object(
         &self,
         object_id: impl Into<String>,
@@ -68,9 +88,51 @@ impl CapturedCursor {
             tool_mode: Some(ToolMode::Cursor),
             start_point: Some(PointF::new(x0, y0)),
             end_point: Some(PointF::new(x0 + self.width as f64, y0 + self.height as f64)),
+            image: encode_rgba_png_base64(self.width, self.height, &self.rgba),
+            opacity: Some(100.0),
             ..CaptureObject::default()
         }
     }
+}
+
+fn encode_base64_standard(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+fn encode_rgba_png_base64(width: u32, height: u32, rgba: &[u8]) -> Option<String> {
+    let expected = (width as usize).checked_mul(height as usize)?.checked_mul(4)?;
+    if width == 0 || height == 0 || rgba.len() != expected {
+        return None;
+    }
+    let mut png_bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png_bytes, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().ok()?;
+        writer.write_image_data(rgba).ok()?;
+    }
+    Some(encode_base64_standard(&png_bytes))
 }
 
 /// Pure decoder for monochrome Win32 cursor masks (top half = AND mask, bottom half = XOR mask).
@@ -613,10 +675,16 @@ mod tests {
             height: 32,
             rgba: vec![255; 32 * 32 * 4],
         };
+        assert!(cursor.intersects_rect(100, 50, 800, 600));
+        assert!(!cursor.intersects_rect(0, 0, 200, 200));
         let obj = cursor.to_capture_object("cursor-1", 100, 50);
         assert_eq!(obj.tool_mode, Some(ToolMode::Cursor));
         assert_eq!(obj.start_point, Some(PointF::new(396.0, 248.0)));
         assert_eq!(obj.end_point, Some(PointF::new(428.0, 280.0)));
+        assert!(
+            obj.image.as_deref().is_some_and(|b64| b64.starts_with("iVBORw0KGgo")),
+            "CapturedCursor must embed a valid Base64 PNG payload into CaptureObject.image"
+        );
     }
 
     #[test]

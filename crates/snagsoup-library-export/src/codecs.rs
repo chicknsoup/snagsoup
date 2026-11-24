@@ -211,6 +211,22 @@ pub fn export_svg_string(page: &SnagxPage, bg_bitmap: Option<&TiledBitmap>) -> R
         let sw = obj.stroke_width.unwrap_or(2.0);
         let mode = obj.tool_mode.clone().unwrap_or(ToolMode::Shape);
 
+        if let (Some(img_b64), Some(s), Some(e)) =
+            (obj.image.as_deref(), obj.start_point, obj.end_point)
+        {
+            let trimmed = img_b64.trim();
+            if !trimmed.is_empty() {
+                let x = s.x.min(e.x);
+                let y = s.y.min(e.y);
+                let rw = (e.x - s.x).abs().max(1.0);
+                let rh = (e.y - s.y).abs().max(1.0);
+                svg.push_str(&format!(
+                    "  <image x=\"{x:.2}\" y=\"{y:.2}\" width=\"{rw:.2}\" height=\"{rh:.2}\" opacity=\"{op:.3}\" href=\"data:image/png;base64,{trimmed}\"/>\n"
+                ));
+                continue;
+            }
+        }
+
         match mode {
             ToolMode::Arrow | ToolMode::Line => {
                 if let (Some(s), Some(e)) = (obj.start_point, obj.end_point) {
@@ -272,6 +288,7 @@ pub fn export_svg_string(page: &SnagxPage, bg_bitmap: Option<&TiledBitmap>) -> R
                     }
                 }
             }
+            ToolMode::Cursor | ToolMode::Image => {}
             _ => {
                 if let (Some(s), Some(e)) = (obj.start_point, obj.end_point) {
                     let x = s.x.min(e.x);

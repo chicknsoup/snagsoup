@@ -277,6 +277,7 @@ fn render_object_preview(pixmap: &mut Pixmap, obj: &CaptureObject, transform: Tr
         ToolMode::Text => render_text_object(pixmap, obj, transform),
         ToolMode::Blur => render_blur_or_pixelate(pixmap, obj, transform),
         ToolMode::Magnify => render_magnify_object(pixmap, obj, transform),
+        ToolMode::Cursor | ToolMode::Image => {}
         _ => render_shape(pixmap, obj, transform),
     }
 }

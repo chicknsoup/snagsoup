@@ -1,4 +1,4 @@
-# SnagSoup v1.4.2.0
+# SnagSoup v1.4.2.1
 
 High-performance, 100% local-first multi-monitor screen capture, video recording, OCR, and annotation studio for Windows 10/11 — written in pure **Rust** on top of **GPUI DirectX 11**.
 
