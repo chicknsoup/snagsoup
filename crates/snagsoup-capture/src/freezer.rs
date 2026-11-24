@@ -39,13 +39,34 @@ pub struct FrozenScreen {
 /// Reusable screen freezer holding a warmed `DxgiCapturer` fallback for low-latency captures.
 pub struct ScreenFreezer {
     dxgi: Option<DxgiCapturer>,
+    capture_cursor: bool,
 }
 
 impl ScreenFreezer {
     /// Create a `ScreenFreezer` instantaneously (`0ms` upfront D3D11/DXGI allocation;
     /// DXGI fallback is initialized lazily only if needed).
     pub fn new() -> Self {
-        Self { dxgi: None }
+        Self {
+            dxgi: None,
+            capture_cursor: true,
+        }
+    }
+
+    /// Create a `ScreenFreezer` configured to snapshot or skip the system mouse cursor.
+    pub fn with_cursor(capture_cursor: bool) -> Self {
+        Self {
+            dxgi: None,
+            capture_cursor,
+        }
+    }
+
+    #[inline]
+    fn snapshot_cursor_if_enabled(&self) -> Option<CapturedCursor> {
+        if self.capture_cursor {
+            capture_cursor().ok().flatten()
+        } else {
+            None
+        }
     }
 
     /// Ultra-fast parallel multi-monitor freeze returning **native `BGRA8`** frames ready for
@@ -57,7 +78,7 @@ impl ScreenFreezer {
         &mut self,
     ) -> Result<Vec<(MonitorInfo, FrozenScreen)>, CaptureError> {
         let topology = enumerate_monitors()?;
-        let cursor = capture_cursor().ok().flatten();
+        let cursor = self.snapshot_cursor_if_enabled();
 
         let frames: Vec<Result<CapturedFrame, CaptureError>> = std::thread::scope(|s| {
             let handles: Vec<_> = topology
@@ -107,7 +128,7 @@ impl ScreenFreezer {
     pub fn freeze_virtual_desktop(&mut self) -> Result<FrozenScreen, CaptureError> {
         let started = Instant::now();
         let topology = enumerate_monitors()?;
-        let cursor = capture_cursor().ok().flatten();
+        let cursor = self.snapshot_cursor_if_enabled();
 
         if topology.monitors.len() == 1 {
             let frame = self.capture_single_monitor(&topology.monitors[0])?;
@@ -182,7 +203,7 @@ impl ScreenFreezer {
             .get(monitor_index)
             .ok_or(CaptureError::InvalidBounds)?
             .clone();
-        let cursor = capture_cursor().ok().flatten();
+        let cursor = self.snapshot_cursor_if_enabled();
         let frame = self.capture_single_monitor(&monitor)?;
 
         Ok(FrozenScreen {

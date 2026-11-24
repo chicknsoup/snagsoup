@@ -728,7 +728,7 @@ pub fn open_selection_overlay_window_full(
 ) {
     // Run fast kernel-title window hierarchy discovery IN PARALLEL alongside the zero-copy WGC
     // monitor ring readback (~4–8ms total wall-clock across all monitors, 0ms extra hierarchy lag!).
-    let mut freezer = ScreenFreezer::new();
+    let mut freezer = ScreenFreezer::with_cursor(include_cursor && !start_in_video_mode);
     let (hierarchy, parallel_res) = std::thread::scope(|s| {
         let hier_job = s.spawn(|| enumerate_window_hierarchy_fast(4));
         let freeze_res = freezer.freeze_all_monitors_bgra_parallel();
@@ -978,6 +978,14 @@ fn open_overlay_windows_internal(
                     if has_cursor {
                         focus_handle.focus(window, cx);
                     }
+                    let frozen_cursor_overlay = build_frozen_cursor_overlay(
+                        captured_cursor.as_ref(),
+                        mon_left,
+                        mon_top,
+                        sw,
+                        sh,
+                        include_cursor && !start_in_video_mode,
+                    );
                     let mut view = SelectionOverlayView::new_from_render_image(
                         sw,
                         sh,
@@ -1007,6 +1015,7 @@ fn open_overlay_windows_internal(
                             on_cap_img(bmp, cursor_obj, cx);
                         },
                     );
+                    view.frozen_cursor_overlay = frozen_cursor_overlay;
                     view.hierarchy = hierarchy_clone;
                     view.state.monitor_left = mon_left;
                     view.state.monitor_top = mon_top;
@@ -1049,6 +1058,31 @@ fn open_overlay_windows_internal(
     }
 }
 
+fn build_frozen_cursor_overlay(
+    cursor: Option<&snagsoup_win_platform::cursor::CapturedCursor>,
+    mon_left: i32,
+    mon_top: i32,
+    sw: u32,
+    sh: u32,
+    include_cursor: bool,
+) -> Option<(i32, i32, u32, u32, Arc<RenderImage>)> {
+    if !include_cursor {
+        return None;
+    }
+    let cur = cursor?;
+    if !cur.intersects_rect(mon_left, mon_top, sw, sh) {
+        return None;
+    }
+    let img = crate::rgba_to_bgra_render_image(cur.width, cur.height, &cur.rgba)?;
+    Some((
+        cur.top_left_x() - mon_left,
+        cur.top_left_y() - mon_top,
+        cur.width,
+        cur.height,
+        img,
+    ))
+}
+
 /// GPUI view rendering the interactive screen selection overlay + Snagit Floating All-in-One Dialog.
 pub struct SelectionOverlayView {
     pub state: SelectionOverlayState,
@@ -1056,6 +1090,7 @@ pub struct SelectionOverlayView {
     pub windows: Vec<WindowInfo>,
     pub hierarchy: Vec<WindowHierarchyEntry>,
     frozen_render_image: Option<Arc<RenderImage>>,
+    frozen_cursor_overlay: Option<(i32, i32, u32, u32, Arc<RenderImage>)>,
     hmonitor: Option<isize>,
     monitor_idx: usize,
     active_monitor_cell: Option<Rc<std::cell::Cell<usize>>>,
@@ -1089,6 +1124,7 @@ impl SelectionOverlayView {
             windows,
             hierarchy: Vec::new(),
             frozen_render_image,
+            frozen_cursor_overlay: None,
             hmonitor: None,
             monitor_idx: 0,
             active_monitor_cell: None,
@@ -1115,6 +1151,7 @@ impl SelectionOverlayView {
             windows,
             hierarchy: Vec::new(),
             frozen_render_image,
+            frozen_cursor_overlay: None,
             hmonitor: None,
             monitor_idx: 0,
             active_monitor_cell: None,
@@ -1448,7 +1485,22 @@ impl Render for SelectionOverlayView {
                         .w_full()
                         .h_full(),
                 )
-            });
+            })
+            // Snapshotted mouse cursor preview rendered ONLY when `Capture Cursor` is toggled ON
+            .when_some(
+                self.frozen_cursor_overlay.clone(),
+                |el, (cx_phys, cy_phys, cw_phys, ch_phys, cur_img)| {
+                    el.child(
+                        img(cur_img)
+                            .object_fit(ObjectFit::Fill)
+                            .absolute()
+                            .left(px(to_logical(cx_phys as f32)))
+                            .top(px(to_logical(cy_phys as f32)))
+                            .w(px(to_logical(cw_phys as f32)))
+                            .h(px(to_logical(ch_phys as f32))),
+                    )
+                },
+            );
 
         // Dimmed veil: 4-band exterior cutout around `highlight` so hovered window / dragged region stays 100% bright!
         if let Some(sel) = highlight {
@@ -2316,6 +2368,10 @@ mod tests {
         let (_bmp_out, cur_outside) =
             crop_frozen_screen(&frozen, RectF::new(120.0, 120.0, 60.0, 60.0), true);
         assert!(cur_outside.is_none());
+        assert!(build_frozen_cursor_overlay(frozen.cursor.as_ref(), 0, 0, 200, 200, false).is_none());
+        let ov_on = build_frozen_cursor_overlay(frozen.cursor.as_ref(), 0, 0, 200, 200, true)
+            .expect("frozen cursor overlay must be created when Capture Cursor is ON");
+        assert_eq!((ov_on.0, ov_on.1, ov_on.2, ov_on.3), (50, 50, 16, 16));
 
         // 2. Cropping a region containing (50, 50) embeds the PNG cursor and renders real emerald pixels (zero #D92B2B red!)
         let (bmp_in, cur_inside) =

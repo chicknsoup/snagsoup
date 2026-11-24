@@ -26,10 +26,10 @@ use gpui::{
 };
 
 /// 4-component build version string (`x.x.x.x`).
-pub const APP_VERSION_FULL: &str = "1.4.2.1";
+pub const APP_VERSION_FULL: &str = "1.4.2.2";
 
 /// Canonical application window title (`SnagSoup vx.x.x.x`).
-pub const APP_TITLE: &str = "SnagSoup v1.4.2.1";
+pub const APP_TITLE: &str = "SnagSoup v1.4.2.2";
 
 /// Standard native Windows 11 titlebar configuration displaying `[Emerald S Icon] SnagSoup v1.0.0.0`.
 pub fn default_titlebar_options() -> TitlebarOptions {
@@ -338,7 +338,7 @@ fn trigger_repeat_last_capture(cx: &mut App) {
         Vec::new()
     };
 
-    let mut freezer = ScreenFreezer::new();
+    let mut freezer = ScreenFreezer::with_cursor(preset.capture_cursor);
     if let Ok(frozen) = freezer.freeze_virtual_desktop() {
         let rect = LAST_CAPTURE_RECT
             .with(|cell| *cell.borrow())
@@ -1032,7 +1032,7 @@ fn run_preset_immediate(
     };
 
     if preset.selection_mode == SelectionMode::FullScreen && !start_in_video_mode {
-        let mut freezer = ScreenFreezer::new();
+        let mut freezer = ScreenFreezer::with_cursor(include_cursor);
         if let Ok(frozen) = freezer.freeze_virtual_desktop() {
             let rect = RectF::new(
                 0.0,
@@ -1175,10 +1175,10 @@ mod tests {
 
     #[test]
     fn app_title_and_titlebar_options_format() {
-        assert_eq!(APP_VERSION_FULL, "1.4.2.1");
-        assert_eq!(APP_TITLE, "SnagSoup v1.4.2.1");
+        assert_eq!(APP_VERSION_FULL, "1.4.2.2");
+        assert_eq!(APP_TITLE, "SnagSoup v1.4.2.2");
         let tb = default_titlebar_options();
         assert!(!tb.appears_transparent);
-        assert_eq!(tb.title.as_deref(), Some("SnagSoup v1.4.2.1"));
+        assert_eq!(tb.title.as_deref(), Some("SnagSoup v1.4.2.2"));
     }
 }
